@@ -1,0 +1,378 @@
+metadata:
+  name: Istio
+  type: implementation
+  dataplane: Envoy
+  version_analyzed: "1.24.x (master branch, April 2026)"
+  repo_url: https://github.com/istio/istio
+  docs_url: https://istio.io/latest/docs/reference/config/networking/destination-rule/
+  last_updated: 2026-04-02
+
+api_stack:
+  translation_model: intermediate
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute.rule.sessionPersistence"
+        - "BackendTrafficPolicy.sessionPersistence"
+      description: "User-facing API. Istio watches these but has NOT yet implemented `sessionPersistence` (TODO #55839)."
+    - name: Istio API
+      type: intermediate
+      resources:
+        - "DestinationRule.trafficPolicy.loadBalancer.consistentHash"
+        - "Service label: istio.io/persistent-session"
+      description: "Istio's native API layer. Session persistence is configured here today. Gateway API would need to translate through this layer (or bypass it)."
+    - name: Envoy xDS
+      type: dataplane
+      resources:
+        - "RouteAction.hash_policy[] (cookie, header)"
+        - "Cluster.lb_policy (RING_HASH / MAGLEV)"
+        - "envoy.filters.http.stateful_session"
+      description: "Envoy's configuration delivered via xDS from istiod. The actual proxy behavior."
+
+native_profile:
+  overview: |
+    Istio provides two completely independent session persistence mechanisms, each using
+    different Envoy features with different trade-offs. `ConsistentHashLB` (via `DestinationRule`)
+    provides soft session affinity using hash-based load balancing. The Stateful Session Filter
+    (via Service labels + env var) provides strong session persistence by encoding backend
+    identity directly into cookies/headers. These two mechanisms have entirely separate
+    configuration surfaces and code paths.
+
+  mechanisms:
+    - name: ConsistentHashLB
+      type: soft_affinity
+      description: |
+        Hash-based load balancing configured via `DestinationRule`. Hashes a request attribute
+        (cookie, header, source IP, or query param) to select a backend from a hash ring.
+        Adding or removing backends shifts the ring and breaks ~1/N existing sessions.
+        Incompatible with locality-based load balancing.
+      enabled_by_default: true
+      configuration_method: "CRD field (DestinationRule.spec.trafficPolicy.loadBalancer.consistentHash)"
+
+      config_options:
+        - field: httpCookie.name
+          type: string
+          required: true
+          default: null
+          description: Cookie name used for hashing
+          support_level: full
+        - field: httpCookie.path
+          type: string
+          required: false
+          default: null
+          description: Cookie path attribute
+          support_level: full
+        - field: httpCookie.ttl
+          type: duration
+          required: false
+          default: null
+          description: "Cookie TTL. If set and cookie absent, Envoy auto-generates one. Zero = session cookie. Unset = no generation."
+          support_level: full
+        - field: httpCookie.attributes[]
+          type: "list of {name, value}"
+          required: false
+          default: null
+          description: "Additional cookie attributes (e.g. `SameSite=None`). Maps to Envoy `RouteAction_HashPolicy_CookieAttribute`."
+          support_level: full
+        - field: httpHeaderName
+          type: string
+          required: false
+          default: null
+          description: Hash on HTTP header value (alternative to cookie)
+          support_level: full
+        - field: useSourceIp
+          type: bool
+          required: false
+          default: false
+          description: Hash on client source IP
+          support_level: full
+        - field: httpQueryParameterName
+          type: string
+          required: false
+          default: null
+          description: Hash on URL query parameter
+          support_level: full
+        - field: ringHash.minimumRingSize
+          type: uint64
+          required: false
+          default: "1024"
+          description: Minimum ring size for ring hash algorithm
+          support_level: full
+        - field: maglev.tableSize
+          type: uint64
+          required: false
+          default: "65537"
+          description: "Maglev table size (must be prime < 5000011)"
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service (by hostname)
+        resource_type: DestinationRule
+        scope: per-service (with per-subset and per-port overrides)
+
+    - name: Stateful Session Filter
+      type: strong_persistence
+      description: |
+        Uses Envoy's `envoy.filters.http.stateful_session` filter to encode the actual backend
+        address (IP:Port, base64) into a cookie or header. On subsequent requests, the filter
+        bypasses the load balancer entirely to route to the exact same backend. Survives backend
+        scaling as long as the specific backend pod is still alive. Has an "unknown security
+        posture" — malicious clients can hand-pick their target backend.
+      enabled_by_default: false
+      configuration_method: "Env var (`PILOT_ENABLE_PERSISTENT_SESSION_FILTER=true`) + Kubernetes Service label"
+
+      config_options:
+        - field: "Service label: istio.io/persistent-session"
+          type: "string (format: 'cookie-name:/path')"
+          required: false
+          default: null
+          description: "Cookie name and path for cookie-based persistence. Path defaults to '/' if omitted."
+          support_level: full
+        - field: "Service label: istio.io/persistent-session-header"
+          type: string
+          required: false
+          default: null
+          description: Header name for header-based persistence
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service (by Kubernetes label)
+        resource_type: Kubernetes Service metadata
+        scope: per-service (applied to all routes targeting the service)
+
+  attachment_points:
+    - mechanism: ConsistentHashLB
+      layer: backend_service
+      native_resource: DestinationRule
+      description: |
+        `DestinationRule` targets a service by hostname. The `consistentHash` config is defined
+        at the service level, but Istio's route builder resolves it per-route by looking up
+        the `DestinationRule` for each route destination. So it's configured at `backend_service`
+        but applied at `route_rule` in Envoy.
+    - mechanism: Stateful Session Filter
+      layer: backend_service
+      native_resource: "Kubernetes Service (label)"
+      description: |
+        Configured via a label on the Kubernetes Service resource. The filter is added at the
+        listener level (disabled) and overridden per-route with service-specific config.
+        Effectively backend_service scoped — all routes to the labeled service get persistence.
+
+  dataplane_translation:
+    description: |
+      `ConsistentHashLB`: `DestinationRule` config is translated per-route. When building Envoy routes,
+      Istio looks up the `DestinationRule` for each route destination, resolves precedence
+      (subset port > subset top > service port > service top), and creates Envoy
+      `RouteAction_HashPolicy` entries. The cluster LB algorithm is set to `RING_HASH` or `MAGLEV`.
+
+      Stateful Session: The filter is added as a disabled HTTP filter at the listener level.
+      Per-route overrides are applied via `TypedPerFilterConfig` with the service-specific
+      cookie/header settings. New sessions use the cluster's default LB (e.g. `LEAST_REQUEST`);
+      subsequent requests bypass LB entirely.
+    envoy_features_used:
+      - "RouteAction_HashPolicy (cookie, header, source_ip, query_param)"
+      - "Cluster LB policy: RING_HASH or MAGLEV"
+      - "envoy.filters.http.stateful_session (cookie or header session state)"
+      - "StatefulSessionPerRoute (typed_per_filter_config override)"
+    key_code_paths:
+      - "pilot/pkg/networking/core/route/route.go — consistentHashToHashPolicy(), hashForVirtualService()"
+      - "pilot/pkg/networking/core/cluster_traffic_policy.go — ApplyRingHashLoadBalancer()"
+      - "pilot/pkg/networking/util/util.go — MaybeBuildStatefulSessionFilterConfig()"
+      - "pilot/pkg/features/pilot.go — PILOT_ENABLE_PERSISTENT_SESSION_FILTER, PILOT_PERSISTENT_SESSION_LABEL"
+    flow: |
+      ConsistentHashLB:
+        DestinationRule → pilot/hashForVirtualService() → HashForHTTPDestination()
+          → consistentHashToHashPolicy() → Envoy RouteAction.hash_policy[]
+          → ApplyRingHashLoadBalancer() → Envoy Cluster.lb_policy = RING_HASH
+
+      Stateful Session:
+        Service label → MaybeBuildStatefulSessionFilterConfig()
+          → BuildStatefulSessionFilter() → Envoy Listener.http_filters[stateful_session] (disabled)
+          → Per-route TypedPerFilterConfig override (enabled, with cookie/header config)
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: true
+    source_ip_affinity: true
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true
+      path: true
+      domain: false
+      ttl: true
+      secure: false    # Not directly configurable, but attributes[] can add it
+      http_only: false  # Same — possible via attributes[]
+      same_site: false  # Same — possible via attributes[]
+    idle_timeout: false
+    absolute_timeout: false  # TTL is cookie expiry, not server-side timeout
+    lifetime_type_session: true   # TTL=0 creates a session cookie
+    lifetime_type_permanent: true  # TTL>0 creates a permanent cookie
+
+  limitations:
+    - "`ConsistentHashLB` is soft affinity only — adding/removing backends breaks ~1/N sessions"
+    - "`ConsistentHashLB` is incompatible with locality-based load balancing"
+    - "Stateful Session Filter is experimental — disabled by default, configured only via Service labels (not CRD)"
+    - "Stateful Session Filter has 'unknown security posture' — clients can hand-pick backends"
+    - "No server-side idle or absolute timeout — `TTL` only controls cookie expiry on the client"
+    - "No first-class CRD field for stateful session — `DestinationRule` only has `ConsistentHashLB`"
+    - "Cookie `Domain` is not configurable in either mechanism"
+    - "Stateful Session Filter has no `TTL`/timeout/attributes configuration (only name and path)"
+
+  known_issues:
+    - url: https://github.com/istio/istio/issues/55839
+      description: "Implement `SessionPersistence` in Gateway API — open, unresolved architectural question (stateful session vs consistent hash)"
+    - url: https://github.com/istio/istio/issues/49000
+      description: "Persistent session filter regression — sessions break after ~1 minute in Istio 1.19+"
+    - url: https://github.com/istio/istio/issues/56268
+      description: "Session affinity broken on pod scale events"
+    - url: https://github.com/istio/istio/issues/39740
+      description: "Original feature request for stateful session affinity"
+    - url: https://github.com/istio/istio/issues/58640
+      description: "Feature request for URL-encoded session persistence via Gateway API"
+
+  # How GEP-1619 attachment points relate to native APIs in the attachment diagram.
+  # For intermediate translation models, this shows the translation path (or lack thereof).
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      native_translation: null
+      label: "no native route-level session API"
+      dataplane_target:
+        name: "Envoy hash_policy or stateful_session"
+        label: "? must bypass native API"
+    btp:
+      target_layer: backend_service
+      native_translations:
+        - mechanism: ConsistentHashLB
+          label: "? soft affinity only"
+        - mechanism: Stateful Session Filter
+          label: "? experimental"
+      dataplane_target:
+        name: "Envoy hash_policy or stateful_session"
+        label: "? mechanism unresolved"
+      open_question: "Which Envoy mechanism should BTP translate to? ConsistentHashLB (soft, proven) or StatefulSession (strong, experimental)?"
+
+gwapi_assessment:
+  overview: |
+    Istio has recognized the need to implement GEP-1619 (tracked in istio/istio#55839) but has
+    NOT yet implemented it. The current code explicitly drops `sessionPersistence` config with a
+    TODO comment. The fundamental architectural question — whether to use Envoy's `StatefulSession`
+    filter (strong persistence) or `ConsistentHashLB` (soft affinity) — remains unresolved. Istio's
+    native `DestinationRule` model attaches to backends (services), which maps well to
+    `BackendTrafficPolicy` but creates tension with route-inline `sessionPersistence`.
+
+  route_inline:
+    difficulty: significant
+    description: |
+      Route-inline `sessionPersistence` has no direct equivalent in Istio's current model.
+      `DestinationRule` (where session config lives) attaches to services, not routes. Istio's
+      route builder bridges this by looking up the `DestinationRule` per-route-destination, but
+      there's no mechanism to define session config AT the route rule level. Implementing this
+      would require either:
+      (a) Translating route-inline config directly to Envoy without going through `DestinationRule`, or
+      (b) Synthesizing virtual `DestinationRule`s from route-inline config.
+    mapping_strategy: |
+      Route-inline `sessionPersistence` → bypass `DestinationRule` entirely → generate Envoy
+      `RouteAction.hash_policy` (for `ConsistentHashLB`) or `StatefulSessionPerRoute` config
+      (for stateful session) directly from the `HTTPRoute` rule.
+    gotchas:
+      - "No native concept of route-level session config — `DestinationRule` is always service-scoped"
+      - "Cookie name uniqueness across route rules is a new constraint with no Istio equivalent"
+      - "Multiple path matches in one rule computing a 'longest common prefix' cookie path has no Istio parallel"
+      - "Route-inline overriding BTP (`DestinationRule`) changes Istio's current precedence model"
+      - "If using `ConsistentHashLB`, changing the cluster LB policy per-route is not straightforward"
+    code_changes_needed:
+      - "`pilot/pkg/config/kube/gateway/` — implement `sessionPersistence` handling (currently TODO)"
+      - "Generate Envoy `hash_policy` or `stateful_session` config from `HTTPRouteRule.SessionPersistence`"
+      - "Add validation for cookie/header name uniqueness across route rules within a Gateway"
+      - "Handle precedence: route-inline `sessionPersistence` overrides BTP `sessionPersistence`"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      `BackendTrafficPolicy` attaching to a Service maps naturally to Istio's `DestinationRule`
+      model (which also attaches to a service). The config options (cookie name, type, timeouts)
+      have reasonable Envoy equivalents. The main challenge is deciding which Envoy mechanism
+      to use (hash policy vs stateful session) and handling fields that don't map directly
+      (idle timeout, lifetime type).
+    mapping_strategy: |
+      `BackendTrafficPolicy.sessionPersistence` → either:
+      (a) Generate a `DestinationRule` with `ConsistentHashLB` config, or
+      (b) Generate `StatefulSession` filter config (requires `PILOT_ENABLE_PERSISTENT_SESSION_FILTER`
+          or inlining that logic into the Gateway API controller)
+    gotchas:
+      - "Fundamental design choice: `ConsistentHashLB` (soft) vs `StatefulSession` (strong) is unresolved"
+      - "GEP-1619 says session persistence is 'strong' — this implies `StatefulSession`, not `ConsistentHashLB`"
+      - "`StatefulSession` filter is behind a feature flag and lacks CRD-level configuration in Istio"
+      - "Cookie path is always '/' for BTP — matches `StatefulSession` default but not `ConsistentHashLB` (which has no default)"
+      - "`IdleTimeout` has no Envoy equivalent in either mechanism — would need server-side tracking"
+      - "`AbsoluteTimeout` maps to cookie `TTL` for `ConsistentHashLB` but `StatefulSession` has no `TTL` field"
+      - "`LifetimeType` (`Session` vs `Permanent`) maps to `TTL=0` vs `TTL>0` in `ConsistentHashLB`"
+    code_changes_needed:
+      - "`pilot/pkg/config/kube/gateway/backend_policies.go` — replace TODO with actual implementation"
+      - "Decide on Envoy mechanism (`StatefulSession` vs `ConsistentHashLB`)"
+      - "Map `SessionPersistence` fields to chosen Envoy config"
+      - "Handle cookie name uniqueness validation across BTPs"
+      - "If using `StatefulSession`: may need to decouple from feature flag / Service label mechanism"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "`consistentHash.httpCookie` (or `StatefulSession` cookie)"
+      mapping_difficulty: direct
+      notes: "Both mechanisms support cookies"
+    - gwapi_field: "type: Header"
+      native_field: "`consistentHash.httpHeaderName` (or `StatefulSession` header)"
+      mapping_difficulty: direct
+      notes: "Both mechanisms support headers"
+    - gwapi_field: "cookie.name"
+      native_field: "`httpCookie.name` (`ConsistentHashLB`) or label value prefix (`StatefulSession`)"
+      mapping_difficulty: direct
+      notes: "Direct mapping in both mechanisms"
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: "`httpCookie.ttl = 0s`"
+      mapping_difficulty: direct
+      notes: "`TTL=0` creates a session cookie in Envoy. `StatefulSession` has no `TTL` field — always session cookie."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: "`httpCookie.ttl > 0`"
+      mapping_difficulty: translation_needed
+      notes: "Requires `AbsoluteTimeout` to be mapped to `TTL`. `StatefulSession` doesn't support this."
+    - gwapi_field: "absoluteTimeout"
+      native_field: "`httpCookie.ttl`"
+      mapping_difficulty: translation_needed
+      notes: "Maps to cookie `TTL` for `ConsistentHashLB`. Not supported in `StatefulSession`. Note: this is client-side expiry only, not server-side enforcement."
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "No Envoy equivalent. Would require server-side session tracking, which neither mechanism provides."
+    - gwapi_field: "cookie path (computed)"
+      native_field: "`httpCookie.path` (`ConsistentHashLB`) or label path suffix (`StatefulSession`)"
+      mapping_difficulty: translation_needed
+      notes: "GEP computes path as longest common prefix of route matches. Istio passes path through directly."
+    - gwapi_field: "header.name"
+      native_field: "`httpHeaderName` (`ConsistentHashLB`) or header label (`StatefulSession`)"
+      mapping_difficulty: direct
+      notes: "Direct mapping"
+
+  deviations:
+    - "Istio's native model is service-scoped (`DestinationRule`), not route-scoped. Route-inline session config has no natural home."
+    - "GEP-1619 defines session persistence as 'strong' but Istio's primary mechanism (`ConsistentHashLB`) is 'soft' affinity."
+    - "Istio's strong persistence (`StatefulSession`) is experimental, behind a feature flag, and configured via labels — not a CRD."
+    - "`IdleTimeout` has no implementation path without server-side session tracking in the dataplane."
+    - "Cookie name uniqueness is a new constraint — Istio has no equivalent validation today."
+    - "The 'longest common prefix' cookie path computation for multiple path matches has no Istio parallel."
+    - "Route-inline overriding BTP inverts Istio's model where `DestinationRule` (backend) is the authority for LB config."
+
+  overall_difficulty: significant
+  summary: |
+    Implementing GEP-1619 in Istio is a significant effort, primarily because:
+    (1) Istio must first resolve whether to use `ConsistentHashLB` or `StatefulSession` — the GEP's
+        definition of "strong" persistence implies `StatefulSession`, but that mechanism is
+        experimental and lacks CRD configuration.
+    (2) Route-inline `sessionPersistence` has no natural equivalent — Istio's session config lives
+        on `DestinationRule` (service-scoped), requiring new code paths to generate per-route
+        Envoy config from `HTTPRoute` rules.
+    (3) `IdleTimeout` is not implementable without dataplane changes.
+    (4) `BackendTrafficPolicy` maps more naturally to `DestinationRule`, but still requires the
+        mechanism choice and field translation work.
+    The existing tracking issue (istio/istio#55839) confirms this is known and in-progress
+    but architecturally unresolved.

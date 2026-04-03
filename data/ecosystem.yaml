@@ -1,0 +1,279 @@
+# Ecosystem map: implementations grouped by architecture type and dataplane
+# Used to generate the ecosystem overview page
+
+definitions:
+  controller:
+    title: Controller (separate dataplane)
+    description: |
+      A Kubernetes controller that watches Gateway API (or other) resources and translates
+      them into configuration for a separate dataplane proxy. The controller and the proxy
+      are distinct components — the controller generates config, the proxy handles traffic.
+      Session persistence configuration flows: User API → Controller → Dataplane Config.
+    examples: "Istio programs Envoy. Contour programs Envoy. NGINX Gateway Fabric programs Nginx."
+
+  integrated:
+    title: Integrated (controller + dataplane)
+    description: |
+      A single system that acts as both the Kubernetes controller and the proxy dataplane.
+      It watches Gateway API resources and directly handles traffic — there's no separate
+      "config translation" step to a different proxy. Session persistence is implemented
+      natively within the same system.
+    examples: "Kong handles both API resources and proxying. Traefik watches routes and serves traffic."
+
+  dataplane_only:
+    title: Dataplane Only (no Gateway API controller)
+    description: |
+      A proxy or load balancer that handles traffic but has no built-in Gateway API controller.
+      These are included because many Gateway API controllers use them under the hood. Understanding
+      their native session persistence capabilities shows what's possible (and what's limited)
+      at the proxy level.
+    examples: "Envoy is used by Istio, Contour, and Envoy Gateway. Nginx is used by NGINX Gateway Fabric."
+
+  cloud_managed:
+    title: Cloud Managed
+    description: |
+      Cloud provider managed load balancers with Gateway API support. The dataplane is a
+      proprietary cloud service. Session persistence capabilities are determined by the
+      cloud provider's load balancer features.
+    examples: "GKE uses Google Cloud Load Balancer. Azure uses Application Gateway."
+
+translation_models:
+  direct:
+    title: Direct Translation
+    description: |
+      The implementation translates Gateway API resources directly into dataplane configuration
+      with no intermediate API layer. Session persistence fields on HTTPRoute or BackendTrafficPolicy
+      are read by the controller and rendered straight into proxy config (e.g. nginx.conf directives,
+      Envoy xDS). This is the simplest model — fewer layers means fewer translation gaps, but it
+      also means the implementation has no pre-existing session persistence API to leverage.
+    examples: "NGINX Gateway Fabric reads sessionPersistence from HTTPRoute and generates sticky cookie directives in nginx.conf. Envoy Gateway translates directly to Envoy xDS."
+    implications: |
+      For GEP-1619: direct implementations are typically easier to integrate because there's
+      no intermediate API to map through or bypass. The controller just needs to read the new
+      fields and generate the right dataplane config.
+
+  intermediate:
+    title: Intermediate API Translation
+    description: |
+      The implementation has its own API layer (CRDs, config objects) between Gateway API and the
+      dataplane. Session persistence may already be configurable through the intermediate API
+      (e.g. Istio's DestinationRule). Gateway API session persistence must either translate through
+      this intermediate layer or bypass it to configure the dataplane directly.
+    examples: "Istio translates Gateway API → DestinationRule/VirtualService → Envoy xDS. Contour translates Gateway API → HTTPProxy → Envoy xDS."
+    implications: |
+      For GEP-1619: intermediate implementations face a design choice — should Gateway API
+      sessionPersistence map to the existing intermediate API (reusing proven code paths), or
+      bypass it and generate dataplane config directly (avoiding intermediate API limitations)?
+      This choice affects complexity, feature parity, and maintenance.
+
+implementations:
+  # --- Controllers with Envoy dataplane ---
+  - name: Istio
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: Contour
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: Emissary-Ingress
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: Envoy Gateway
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: false
+    gwapi_support: true
+    note: "GWAPI-only — uses Gateway API sessionPersistence"
+
+  - name: kgateway
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: true
+    gwapi_support: true
+    note: "Formerly Gloo Gateway. Uses Gateway API sessionPersistence + BackendConfigPolicy for consistent hashing."
+
+  - name: Hashicorp Consul
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: false
+    gwapi_support: true
+    note: "GWAPI-only"
+
+  - name: Kuma
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: false
+    gwapi_support: true
+
+  - name: Acnodal EPIC
+    type: controller
+    dataplane: Envoy
+    has_session_persistence: false
+    gwapi_support: true
+    note: "GWAPI-only"
+
+  # --- Controllers with Nginx dataplane ---
+  - name: Apache APISIX
+    type: controller
+    dataplane: Nginx
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: NGINX Gateway Fabric
+    type: controller
+    dataplane: Nginx
+    has_session_persistence: false
+    gwapi_support: true
+    note: "GWAPI-only"
+
+  # --- Controllers with HAProxy dataplane ---
+  - name: HAProxy Ingress
+    type: controller
+    dataplane: HAProxy
+    has_session_persistence: true
+    gwapi_support: true
+
+  # --- Controllers with other dataplanes ---
+  - name: BIG-IP Kubernetes Gateway
+    type: controller
+    dataplane: F5 BIG-IP
+    has_session_persistence: false
+    gwapi_support: true
+    note: "GWAPI-only"
+
+  - name: Flomesh Service Mesh
+    type: controller
+    dataplane: Pipy
+    has_session_persistence: false
+    gwapi_support: true
+
+  # --- Integrated (controller IS the dataplane) ---
+  - name: Kong
+    type: integrated
+    dataplane: Built-in
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: Traefik
+    type: integrated
+    dataplane: Built-in
+    has_session_persistence: true
+    gwapi_support: false
+    note: "Gateway API sessionPersistence PR #12537 open, not merged"
+
+  - name: Cilium
+    type: integrated
+    dataplane: Built-in (eBPF)
+    has_session_persistence: false
+    gwapi_support: true
+
+  - name: Linkerd
+    type: integrated
+    dataplane: Built-in (Rust proxy)
+    has_session_persistence: false
+    gwapi_support: true
+    note: "GAMMA mesh implementation"
+
+  - name: Easegress
+    type: integrated
+    dataplane: Built-in
+    has_session_persistence: false
+    gwapi_support: true
+
+  - name: STUNner
+    type: integrated
+    dataplane: Built-in
+    has_session_persistence: false
+    gwapi_support: true
+
+  - name: Tyk
+    type: integrated
+    dataplane: Built-in
+    has_session_persistence: false
+    gwapi_support: true
+
+  - name: WSO2 APK
+    type: integrated
+    dataplane: Built-in
+    has_session_persistence: false
+    gwapi_support: true
+
+  - name: Avi Kubernetes Operator
+    type: integrated
+    dataplane: NSX ALB
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: LiteSpeed
+    type: integrated
+    dataplane: Built-in
+    has_session_persistence: false
+    gwapi_support: true
+
+  # --- Cloud Managed ---
+  - name: Google Kubernetes Engine
+    type: cloud_managed
+    dataplane: Google Cloud LB
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: Azure App Gateway for Containers
+    type: cloud_managed
+    dataplane: Azure App Gateway
+    has_session_persistence: true
+    gwapi_support: true
+
+  - name: Amazon EKS
+    type: cloud_managed
+    dataplane: AWS LB
+    has_session_persistence: false
+    gwapi_support: true
+    note: "GWAPI-only"
+
+  # --- Dataplane Only (no GWAPI controller) ---
+  - name: Envoy
+    type: dataplane_only
+    dataplane: self
+    has_session_persistence: true
+    gwapi_support: false
+
+  - name: Nginx
+    type: dataplane_only
+    dataplane: self
+    has_session_persistence: true
+    gwapi_support: false
+    note: "Cookie persistence is Nginx Plus only"
+
+  - name: HAProxy
+    type: dataplane_only
+    dataplane: self
+    has_session_persistence: true
+    gwapi_support: false
+
+  - name: Apache httpd
+    type: dataplane_only
+    dataplane: self
+    has_session_persistence: true
+    gwapi_support: false
+
+  - name: Google CloudRun
+    type: dataplane_only
+    dataplane: self
+    has_session_persistence: true
+    gwapi_support: false
+    note: "On/off toggle only"
+
+  - name: Java Servlet
+    type: dataplane_only
+    dataplane: self
+    has_session_persistence: true
+    gwapi_support: false
+    note: "Not a proxy — application-level sessions"

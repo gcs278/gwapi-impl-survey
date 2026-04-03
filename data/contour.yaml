@@ -1,0 +1,537 @@
+metadata:
+  name: Contour
+  type: controller
+  dataplane: Envoy
+  version_analyzed: "v1.33.3 (latest stable, April 2026)"
+  repo_url: https://github.com/projectcontour/contour
+  docs_url: https://projectcontour.io/docs/
+  last_updated: 2026-04-03
+
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute (no sessionPersistence support)"
+        - "GRPCRoute (no sessionPersistence support)"
+        - "TLSRoute"
+        - "TCPRoute"
+        - "BackendTLSPolicy"
+      description: |
+        Contour supports Gateway API as a first-class API. It processes HTTPRoute, GRPCRoute,
+        TLSRoute, TCPRoute, and BackendTLSPolicy resources. However, Contour does NOT implement
+        the `sessionPersistence` field on HTTPRoute or GRPCRoute rules. Gateway API session
+        persistence (GEP-1619) is tracked by issue #6427 but remains unimplemented as of v1.33.3.
+        Contour does NOT have any equivalent to BackendLBPolicy.
+    - name: HTTPProxy CRD (native API)
+      type: native
+      resources:
+        - "HTTPProxy.spec.routes[].loadBalancerPolicy"
+        - "HTTPProxy.spec.tcpproxy.loadBalancerPolicy"
+        - "LoadBalancerPolicy (strategy + requestHashPolicies)"
+        - "RequestHashPolicy (headerHashOptions, cookieHashOptions, hashSourceIP, queryParameterHashOptions)"
+      description: |
+        Contour's native API is the HTTPProxy CRD (projectcontour.io/v1). Session affinity is
+        configured via `loadBalancerPolicy` on route or tcpproxy objects. The `strategy: Cookie`
+        option provides a built-in cookie-based session affinity with a hardcoded cookie name
+        (`X-Contour-Session-Affinity`). The `strategy: RequestHash` option provides flexible
+        hashing on headers, query parameters, cookies, or source IP. Both strategies use Envoy's
+        RING_HASH cluster LB policy with route-level hash policies. There is no stateful_session
+        filter support - Contour relies exclusively on consistent hashing (soft affinity).
+    - name: DAG (Directed Acyclic Graph) IR
+      type: intermediate
+      resources:
+        - "dag.Route (RequestHashPolicies []RequestHashPolicy)"
+        - "dag.Cluster (LoadBalancerPolicy string)"
+        - "dag.RequestHashPolicy"
+        - "dag.CookieHashOptions"
+        - "dag.HeaderHashOptions"
+        - "dag.QueryParameterHashOptions"
+      description: |
+        Contour translates both HTTPProxy and Gateway API resources into an internal DAG
+        (Directed Acyclic Graph) intermediate representation. The DAG contains Route and Cluster
+        objects. Route objects carry `RequestHashPolicies` for hash-based load balancing.
+        Cluster objects carry a `LoadBalancerPolicy` string (e.g. "Cookie", "RequestHash").
+        IMPORTANT: The Gateway API processor (`gatewayapi_processor.go`) does NOT populate
+        `RequestHashPolicies` on DAG Routes — only the HTTPProxy processor does. This is why
+        Gateway API routes have no session affinity in Contour.
+    - name: Envoy xDS
+      type: dataplane
+      resources:
+        - "envoy_config_cluster_v3.Cluster (LbPolicy: RING_HASH)"
+        - "RouteAction_HashPolicy (Header, Cookie, ConnectionProperties, QueryParameter)"
+      description: |
+        Envoy's xDS configuration. Contour uses RING_HASH cluster LB policy for both Cookie
+        and RequestHash strategies. Hash policies are set on RouteAction for each route.
+        Contour does NOT use Envoy's `stateful_session` HTTP filter at all — it relies
+        exclusively on consistent hashing via RING_HASH + hash_policy.
+
+native_profile:
+  overview: |
+    Contour (projectcontour.io) is a CNCF graduated Envoy-based ingress controller and Gateway API
+    implementation. Its native API is the HTTPProxy CRD. Contour provides session affinity
+    (NOT strong session persistence) via two load balancer strategies on HTTPProxy routes:
+
+    1. **Cookie strategy** (`loadBalancerPolicy.strategy: Cookie`):
+       A built-in, zero-configuration cookie-based session affinity. Contour automatically
+       creates a cookie named `X-Contour-Session-Affinity` with TTL=0 (session cookie) and
+       path=`/`. This cookie is used as input to Envoy's RING_HASH algorithm. The cookie name,
+       TTL, path, and other attributes are NOT user-configurable. This was the original session
+       affinity mechanism from Contour's early days (IngressRoute era).
+
+    2. **RequestHash strategy** (`loadBalancerPolicy.strategy: RequestHash`):
+       A flexible hash-based load balancing strategy that can hash on request headers, query
+       parameters, cookies (not yet exposed in API), or source IP. Users specify a list of
+       `requestHashPolicies` with options like `headerHashOptions.headerName`,
+       `queryParameterHashOptions.parameterName`, or `hashSourceIP: true`. Multiple hash
+       policies can be chained with the `terminal` flag for short-circuit evaluation.
+
+    Architecture:
+    - Contour runs as a control plane that watches Kubernetes resources and builds a DAG
+      (Directed Acyclic Graph) intermediate representation
+    - Both HTTPProxy and Gateway API resources are translated into the same DAG
+    - The DAG is then translated to Envoy xDS configuration
+    - For Gateway API, the translation is: Gateway API -> DAG -> Envoy xDS (direct, NOT via HTTPProxy)
+    - For HTTPProxy, the translation is: HTTPProxy -> DAG -> Envoy xDS
+
+    Key limitation: Contour uses ONLY Envoy's consistent hashing (RING_HASH + hash_policy) for
+    session affinity. It does NOT use Envoy's `stateful_session` HTTP filter. This means all
+    session affinity in Contour is "soft" — affinity is best-effort and can be lost when
+    backends scale, the hash ring changes, or the gateway restarts. Issue #4480 requested
+    stateful_session filter support but was closed as stale without implementation.
+
+    Gateway API session persistence: NOT IMPLEMENTED. Issue #6427 tracks implementing
+    `sessionPersistence` on HTTPRoute rules and BackendLBPolicy, but no work has been done.
+    The Gateway API processor in `gatewayapi_processor.go` does not read `sessionPersistence`
+    from route rules and does not set `RequestHashPolicies` on DAG Route objects.
+
+  mechanisms:
+    - name: Cookie-based Session Affinity (built-in)
+      type: soft_affinity
+      description: |
+        Uses Envoy's RING_HASH cluster LB policy with a hardcoded cookie hash policy.
+        Cookie name is `X-Contour-Session-Affinity`, TTL is 0 (session cookie), path is `/`.
+        The cookie is generated by Envoy (not Contour) on the first request. Subsequent
+        requests with the cookie are hashed to the same backend via the ring hash algorithm.
+        This is soft affinity — backend scaling or ring perturbation can redistribute sessions.
+      enabled_by_default: false
+      configuration_method: "HTTPProxy loadBalancerPolicy.strategy: Cookie"
+
+      config_options:
+        - field: loadBalancerPolicy.strategy
+          type: "string (enum: Cookie)"
+          required: true
+          default: null
+          description: "Must be set to 'Cookie' to enable cookie-based session affinity."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Route
+        resource_type: "HTTPProxy.spec.routes[].loadBalancerPolicy"
+        scope: "per-route on HTTPProxy"
+
+    - name: Request Hash Session Affinity
+      type: soft_affinity
+      description: |
+        Uses Envoy's RING_HASH cluster LB policy with user-specified hash policies.
+        Supports hashing on request headers, query parameters, or source IP. Users can
+        define multiple hash policies with terminal flags for fallback behavior. Like the
+        Cookie strategy, this is soft affinity based on consistent hashing.
+      enabled_by_default: false
+      configuration_method: "HTTPProxy loadBalancerPolicy.strategy: RequestHash + requestHashPolicies[]"
+
+      config_options:
+        - field: loadBalancerPolicy.strategy
+          type: "string (enum: RequestHash)"
+          required: true
+          default: null
+          description: "Must be set to 'RequestHash' to enable request attribute hash-based load balancing."
+          support_level: full
+        - field: requestHashPolicies[].headerHashOptions.headerName
+          type: string
+          required: false
+          default: null
+          description: "Hash on the value of a specific HTTP request header. If header is absent, this policy produces no hash."
+          support_level: full
+        - field: requestHashPolicies[].queryParameterHashOptions.parameterName
+          type: string
+          required: false
+          default: null
+          description: "Hash on the value of a specific query parameter."
+          support_level: full
+        - field: requestHashPolicies[].hashSourceIP
+          type: bool
+          required: false
+          default: false
+          description: "Hash on the client's source IP address."
+          support_level: full
+        - field: requestHashPolicies[].terminal
+          type: bool
+          required: false
+          default: false
+          description: "If true and this policy matches, skip remaining hash policies."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Route
+        resource_type: "HTTPProxy.spec.routes[].loadBalancerPolicy"
+        scope: "per-route on HTTPProxy"
+
+  attachment_points:
+    - mechanism: Cookie-based Session Affinity
+      layer: route_rule
+      native_resource: "HTTPProxy.spec.routes[].loadBalancerPolicy (strategy: Cookie)"
+      description: |
+        Cookie session affinity is configured per-route on HTTPProxy resources via
+        `loadBalancerPolicy.strategy: Cookie`. The cookie name, TTL, and path are hardcoded
+        and not user-configurable. The `loadBalancerPolicy` field exists on both Route and
+        TCPProxy objects, but Cookie strategy is only valid on Route (rejected on TCPProxy).
+    - mechanism: Request Hash Session Affinity
+      layer: route_rule
+      native_resource: "HTTPProxy.spec.routes[].loadBalancerPolicy (strategy: RequestHash)"
+      description: |
+        RequestHash session affinity is configured per-route on HTTPProxy resources via
+        `loadBalancerPolicy.strategy: RequestHash` with a list of `requestHashPolicies`.
+        Each policy specifies exactly one hash attribute (header, query param, source IP).
+        Like Cookie strategy, RequestHash is only valid on Route, not TCPProxy.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "not implemented"
+      dataplane_target:
+        name: "stateful_session filter or RING_HASH hash_policy"
+        label: "would generate"
+    btp:
+      target_layer: backend_service
+      label: "not implemented"
+      dataplane_target:
+        name: "stateful_session filter or RING_HASH hash_policy"
+        label: "would generate"
+
+  dataplane_translation:
+    description: |
+      Contour translates HTTPProxy resources through a multi-stage pipeline:
+
+      1. HTTPProxy -> DAG: The `httpproxy_processor.go` reads `route.LoadBalancerPolicy` and
+         calls `loadBalancerRequestHashPolicies()` which returns `[]RequestHashPolicy` and a
+         strategy string. For `Cookie` strategy, this creates a single hash policy with the
+         hardcoded cookie (`X-Contour-Session-Affinity`, TTL=0, path=/). For `RequestHash`,
+         it validates and converts each `RequestHashPolicy` from the CRD.
+
+      2. DAG -> Envoy xDS:
+         - Cluster: `cluster.go` calls `lbPolicy()` which maps `Cookie` and `RequestHash`
+           strategies to `Cluster_RING_HASH`. All other strategies get ROUND_ROBIN, RANDOM,
+           or LEAST_REQUEST.
+         - Route: `route.go` calls `hashPolicy()` which converts `dag.RequestHashPolicy`
+           entries to Envoy `RouteAction_HashPolicy` entries. This generates Envoy hash
+           policies for cookies, headers, query parameters, or connection properties (source IP).
+
+      For Gateway API, the translation is similar but INCOMPLETE:
+      - `gatewayapi_processor.go` creates DAG Route and Cluster objects directly (NOT via HTTPProxy)
+      - However, it does NOT read `sessionPersistence` from HTTPRoute/GRPCRoute rules
+      - It does NOT set `RequestHashPolicies` on DAG Route objects
+      - It does NOT set `LoadBalancerPolicy` on DAG Cluster objects (defaults to ROUND_ROBIN)
+      - Result: Gateway API routes have no session persistence/affinity whatsoever
+
+    envoy_features_used:
+      - "Cluster_RING_HASH (envoy_config_cluster_v3.Cluster_LbPolicy)"
+      - "RouteAction_HashPolicy_Cookie_ (cookie name, TTL, path)"
+      - "RouteAction_HashPolicy_Header_ (header name)"
+      - "RouteAction_HashPolicy_QueryParameter_ (parameter name)"
+      - "RouteAction_HashPolicy_ConnectionProperties_ (source IP)"
+    envoy_features_NOT_used:
+      - "envoy.filters.http.stateful_session — NOT used anywhere in Contour"
+      - "StatefulSessionPerRoute — NOT used"
+      - "CookieBasedSessionState — NOT used"
+      - "HeaderBasedSessionState — NOT used"
+    key_code_paths:
+      - "apis/projectcontour/v1/httpproxy.go — LoadBalancerPolicy, RequestHashPolicy, HeaderHashOptions, QueryParameterHashOptions types"
+      - "internal/dag/policy.go — loadBalancerPolicy(), loadBalancerRequestHashPolicies() (Cookie strategy creates hardcoded X-Contour-Session-Affinity cookie)"
+      - "internal/dag/dag.go — Route.RequestHashPolicies, Cluster.LoadBalancerPolicy, RequestHashPolicy, CookieHashOptions, HeaderHashOptions structs"
+      - "internal/dag/httpproxy_processor.go — processes HTTPProxy loadBalancerPolicy into DAG (line ~814)"
+      - "internal/dag/gatewayapi_processor.go — processes Gateway API routes into DAG (NO session persistence support, clusterRoutes() does not set RequestHashPolicies)"
+      - "internal/envoy/v3/cluster.go — lbPolicy() maps Cookie/RequestHash to RING_HASH, Cluster() sets LbPolicy on Envoy cluster"
+      - "internal/envoy/v3/route.go — hashPolicy() converts dag.RequestHashPolicy to Envoy RouteAction_HashPolicy entries"
+      - "design/session-affinity.md — original session affinity design document (Cookie strategy)"
+      - "design/loadbalancer-hash-policy-design.md — RequestHash strategy design document"
+    flow: |
+      HTTPProxy Session Affinity (Cookie strategy):
+        HTTPProxy.route.loadBalancerPolicy.strategy: Cookie
+          -> policy.go: loadBalancerRequestHashPolicies()
+            -> RequestHashPolicy{CookieHashOptions{
+                 CookieName: "X-Contour-Session-Affinity",
+                 TTL: 0, Path: "/"}}
+          -> httpproxy_processor.go: sets Route.RequestHashPolicies and Cluster.LoadBalancerPolicy
+          -> cluster.go: lbPolicy("Cookie") => Cluster_RING_HASH
+          -> route.go: hashPolicy() => RouteAction_HashPolicy_Cookie_{...}
+
+      HTTPProxy Session Affinity (RequestHash strategy):
+        HTTPProxy.route.loadBalancerPolicy.strategy: RequestHash
+          -> policy.go: loadBalancerRequestHashPolicies()
+            -> validates and converts RequestHashPolicy list
+          -> httpproxy_processor.go: sets Route.RequestHashPolicies and Cluster.LoadBalancerPolicy
+          -> cluster.go: lbPolicy("RequestHash") => Cluster_RING_HASH
+          -> route.go: hashPolicy() => RouteAction_HashPolicy_{Header|Cookie|ConnectionProperties|QueryParameter}
+
+      Gateway API (NOT IMPLEMENTED):
+        HTTPRoute.rule.sessionPersistence -> IGNORED by gatewayapi_processor.go
+        No RequestHashPolicies set on DAG Route
+        No LoadBalancerPolicy set on DAG Cluster
+        Result: ROUND_ROBIN, no session affinity
+
+  capabilities:
+    cookie_persistence: false  # No strong persistence (stateful_session) — only soft affinity via consistent hash cookie
+    header_persistence: false  # No header-based strong persistence
+    source_ip_affinity: true   # Via RequestHash strategy with hashSourceIP
+    url_encoded_sessions: false
+    cookie_affinity: true      # Via Cookie strategy (soft affinity, RING_HASH)
+    header_affinity: true      # Via RequestHash strategy with headerHashOptions
+    query_parameter_affinity: true  # Via RequestHash with queryParameterHashOptions
+    cookie_attributes:
+      name: false    # Hardcoded to X-Contour-Session-Affinity for Cookie strategy; not user-configurable
+      path: false    # Hardcoded to "/" for Cookie strategy; not user-configurable
+      domain: false
+      ttl: false     # Hardcoded to 0 (session cookie) for Cookie strategy; not user-configurable
+      secure: false
+      http_only: false
+      same_site: false
+    idle_timeout: false
+    absolute_timeout: false
+    lifetime_type_session: false  # Cookie strategy always creates session cookies (TTL=0) but this is not configurable
+    lifetime_type_permanent: false  # No way to create persistent cookies
+
+  limitations:
+    - "Cookie strategy uses a HARDCODED cookie name (`X-Contour-Session-Affinity`) — not user-configurable (issue #2856 requests this)"
+    - "Cookie strategy has HARDCODED TTL=0 (session cookie), path=`/` — not user-configurable"
+    - "No strong session persistence — Contour does NOT use Envoy's `stateful_session` filter (issue #4480 requested it, closed stale)"
+    - "All session affinity is SOFT (consistent hashing via RING_HASH) — affinity lost when backends scale, hash ring changes, or pods restart"
+    - "Cookie strategy bootstrapping problem — application-supplied cookies cannot be reused (documented in session-affinity.md design)"
+    - "No cookie attributes configurable (Secure, HttpOnly, SameSite, Domain, custom name, custom TTL)"
+    - "Gateway API session persistence NOT IMPLEMENTED — issue #6427 open since 2024, no work done"
+    - "No BackendLBPolicy support"
+    - "RequestHash strategy does not expose cookie hash policies through the API (only in DAG internals)"
+    - "TCPProxy rejects Cookie and RequestHash strategies — only HTTP routes support session affinity"
+    - "Session affinity design explicitly chose NOT to support header-based or client IP persistence initially (though RequestHash added header and source IP later)"
+
+  known_issues:
+    - url: "https://github.com/projectcontour/contour/issues/6427"
+      description: "Gateway API: implement session persistence + BackendLBPolicy [experimental]. Open since 2024, no implementation work done. Labeled 'help wanted'."
+    - url: "https://github.com/projectcontour/contour/issues/2856"
+      description: "Add support for an application-specified cookie for load balancing policy. Open since 2020, labeled 'blocked/needs-design'. Users want custom cookie names instead of hardcoded X-Contour-Session-Affinity."
+    - url: "https://github.com/projectcontour/contour/issues/4480"
+      description: "Use Envoy Stateful Session HTTP filter. Closed as stale. Would enable strong persistence (survive backend scaling) but never implemented."
+    - url: "https://github.com/projectcontour/contour/issues/3808"
+      description: "Session affinity irrespective of backend scaling. Closed as wontfix. Users wanted affinity to survive pod scaling, but RING_HASH cannot guarantee this."
+    - url: "https://github.com/projectcontour/contour/issues/3703"
+      description: "Session affinity: source IP. Closed. Source IP affinity was later partially addressed via RequestHash strategy with hashSourceIP."
+    - url: "https://github.com/projectcontour/contour/issues/4190"
+      description: "LB Policy Cookie not work. Closed. Bug report about Cookie strategy not working correctly."
+
+gwapi_assessment:
+  overview: |
+    Contour has NOT implemented Gateway API session persistence (GEP-1619). Issue #6427 tracks
+    this feature but remains open with no implementation work as of v1.33.3 (April 2026). The
+    issue has received community interest (comments asking for updates) but is labeled "help
+    wanted" indicating the Contour team lacks contributors to implement it.
+
+    Key challenges for Contour implementing GEP-1619:
+
+    1. **No stateful_session filter**: Contour's existing session affinity uses only RING_HASH
+       consistent hashing. GEP-1619's `sessionPersistence` field implies "strong" persistence
+       (the Gateway API spec says persistence SHOULD survive backend scaling), which requires
+       Envoy's `stateful_session` filter. Contour would need to add entirely new Envoy filter
+       support.
+
+    2. **DAG architecture gap**: The Gateway API processor creates DAG objects but does not
+       populate session affinity fields. The DAG's Route type has `RequestHashPolicies` for
+       consistent hashing but no field for stateful_session filter config. Adding strong
+       persistence would require extending the DAG IR.
+
+    3. **Translation model**: Contour translates Gateway API -> DAG -> Envoy xDS directly
+       (NOT via HTTPProxy). This means the HTTPProxy session affinity code path is not reusable
+       for Gateway API. New code would be needed in `gatewayapi_processor.go`.
+
+    4. **No policy CRD**: Contour does not have a general-purpose traffic policy CRD for
+       Gateway API. There is no equivalent to Envoy Gateway's BackendTrafficPolicy or kgateway's
+       BackendConfigPolicy. Adding BackendLBPolicy would require new CRD development.
+
+  route_inline:
+    difficulty: significant
+    description: |
+      Implementing `HTTPRoute.rule.sessionPersistence` in Contour requires significant work:
+
+      1. **Choose Envoy mechanism**: Contour must decide whether to use:
+         a. Envoy's `stateful_session` filter (strong persistence, encodes backend in cookie/header)
+         b. RING_HASH consistent hashing (soft affinity, current HTTPProxy approach)
+         c. Both (strong persistence for session types, soft affinity for hash types)
+
+         GEP-1619 implies strong persistence, so `stateful_session` filter would be needed.
+
+      2. **Extend DAG IR**: Add session persistence fields to `dag.Route` struct to carry
+         stateful_session configuration. Currently only `RequestHashPolicies` exists for
+         consistent hashing.
+
+      3. **Update Gateway API processor**: Modify `computeHTTPRouteForListener()` and
+         `clusterRoutes()` in `gatewayapi_processor.go` to read `rule.SessionPersistence`
+         from HTTPRoute and populate new DAG fields.
+
+      4. **Add Envoy translation**: Add `stateful_session` filter generation in the Envoy
+         xDS translation layer (`internal/envoy/v3/`). Contour currently has zero code for
+         this filter.
+
+      5. **GRPCRoute support**: Same changes needed for `computeGRPCRouteForListener()`.
+
+      This is a significant undertaking because Contour has never used the `stateful_session`
+      filter and would need to add it from scratch.
+    mapping_strategy: |
+      Gateway API sessionPersistence would need to be mapped to Envoy configuration:
+
+      Option A (Strong persistence via stateful_session filter):
+        sessionPersistence.type: Cookie -> CookieBasedSessionState
+        sessionPersistence.type: Header -> HeaderBasedSessionState
+        sessionPersistence.sessionName -> cookie.name / header.name
+        cookieConfig.lifetimeType -> cookie TTL (Session=0, Permanent=absoluteTimeout)
+        absoluteTimeout -> cookie TTL
+
+        Would require: new DAG IR fields, new Envoy filter generation code,
+        HCM-level filter + per-route TypedPerFilterConfig pattern.
+
+      Option B (Soft affinity via RING_HASH — current HTTPProxy pattern):
+        sessionPersistence.type: Cookie -> RouteAction_HashPolicy_Cookie
+        sessionPersistence.sessionName -> cookie name
+        But: would NOT be "strong" persistence, may not satisfy GEP-1619 intent.
+
+      Option A is the correct approach for GEP-1619 compliance.
+    gotchas:
+      - "Contour has ZERO stateful_session filter code — must be written from scratch"
+      - "DAG IR needs new fields for stateful session config (currently only has RequestHashPolicies)"
+      - "Contour's existing Cookie strategy is fundamentally different from GEP-1619 session persistence"
+      - "Contour Cookie strategy is soft affinity (RING_HASH), GEP-1619 implies strong persistence"
+      - "idleTimeout not supported by Envoy's stateful_session filter"
+      - "Contour project has limited contributors (issues often closed as stale)"
+      - "No experimental features flag mechanism for Gateway API — unlike kgateway"
+    code_changes_needed:
+      - "internal/dag/dag.go — add SessionPersistence field to Route struct, add StatefulSessionConfig type"
+      - "internal/dag/gatewayapi_processor.go — read rule.SessionPersistence in computeHTTPRouteForListener() and computeGRPCRouteForListener()"
+      - "internal/dag/gatewayapi_processor.go — pass session persistence config through clusterRoutes()"
+      - "internal/envoy/v3/ — add stateful_session filter generation (new file or extend listener.go/route.go)"
+      - "internal/envoy/v3/route.go — add TypedPerFilterConfig for stateful_session on routes"
+      - "internal/envoy/v3/listener.go — add disabled stateful_session filter to HCM http_filters"
+
+  backend_traffic_policy:
+    difficulty: significant
+    description: |
+      Contour does NOT have any Gateway API policy attachment CRD for session persistence.
+      There is no BackendLBPolicy, BackendTrafficPolicy, or equivalent. Implementing
+      service-level session persistence would require:
+
+      1. Creating a new CRD (BackendLBPolicy or extending an existing one)
+      2. Adding a new controller/processor for the CRD
+      3. Implementing policy attachment semantics (targetRef to Service)
+      4. Translating to Envoy stateful_session filter config
+      5. Handling precedence between route-inline and service-level policies
+
+      This is substantially more work than route-inline because the infrastructure for
+      policy attachment CRDs does not exist in Contour for session persistence.
+    mapping_strategy: |
+      Would require creating a new CRD. Options:
+      Option A: Implement standard Gateway API BackendLBPolicy directly
+      Option B: Create Contour-specific policy CRD (e.g. ContourSessionPolicy)
+      Option C: Extend HTTPProxy's loadBalancerPolicy (but this doesn't help Gateway API)
+
+      Any option would need the same stateful_session filter translation code as route-inline.
+    gotchas:
+      - "No existing policy attachment CRD infrastructure for Gateway API in Contour"
+      - "Contour's HTTPProxy loadBalancerPolicy is route-level, not service-level"
+      - "Would need to build policy attachment controller from scratch"
+      - "Precedence between HTTPProxy loadBalancerPolicy and BackendLBPolicy undefined"
+    code_changes_needed:
+      - "apis/projectcontour/v1alpha1/ — new BackendLBPolicy or equivalent CRD types"
+      - "internal/dag/ — new processor or extend gatewayapi_processor.go for policy attachment"
+      - "internal/dag/dag.go — service-level session persistence fields"
+      - "All the stateful_session filter code from route-inline (prerequisite)"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "loadBalancerPolicy.strategy: Cookie (RING_HASH + cookie hash policy, NOT stateful_session)"
+      mapping_difficulty: translation_needed
+      notes: |
+        Contour's Cookie strategy is soft affinity via RING_HASH consistent hashing.
+        GEP-1619 Cookie type implies strong persistence via stateful_session filter.
+        These are fundamentally different mechanisms with different guarantees.
+    - gwapi_field: "type: Header"
+      native_field: "loadBalancerPolicy.strategy: RequestHash + headerHashOptions (RING_HASH, NOT stateful_session)"
+      mapping_difficulty: translation_needed
+      notes: |
+        Contour's RequestHash with headerHashOptions provides soft header-based affinity.
+        GEP-1619 Header type implies strong persistence via stateful_session.
+        Different mechanisms — consistent hashing vs stateful session filter.
+    - gwapi_field: "sessionName"
+      native_field: "Not configurable (hardcoded to X-Contour-Session-Affinity for Cookie strategy)"
+      mapping_difficulty: not_supported
+      notes: |
+        Cookie strategy has hardcoded cookie name. RequestHash headerHashOptions.headerName
+        allows custom header names but that is for hashing, not session persistence.
+        Issue #2856 requests user-configurable cookie names.
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: "Cookie strategy TTL=0 (hardcoded, always session cookie)"
+      mapping_difficulty: translation_needed
+      notes: "Cookie strategy always creates session cookies (TTL=0), but this is not configurable — it is the only behavior."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "No way to create persistent cookies. Cookie strategy always uses TTL=0 (session cookie)."
+    - gwapi_field: "absoluteTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "No timeout configuration for session affinity cookies."
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "Not supported. Envoy's stateful_session filter also does not support idle timeout."
+
+  deviations:
+    - "Contour uses ONLY consistent hashing (RING_HASH) for session affinity — no stateful_session filter support"
+    - "Gateway API sessionPersistence field is completely ignored — not read or processed"
+    - "Cookie name is hardcoded to X-Contour-Session-Affinity — not configurable"
+    - "Cookie TTL, path, and other attributes are hardcoded — not configurable"
+    - "No strong session persistence — all affinity is soft and can be lost when backends scale"
+    - "No BackendLBPolicy or equivalent policy CRD for Gateway API"
+    - "No GRPCRoute session persistence (Gateway API processor does not support it)"
+    - "HTTPProxy session affinity code is not shared with Gateway API code path"
+    - "Contour's session affinity design explicitly chose a narrow scope (cookie-only, no header, no IP) for the Cookie strategy"
+    - "RequestHash strategy added header and source IP hashing later but these are for load balancing, not session persistence"
+
+  overall_difficulty: significant
+  summary: |
+    Contour is one of the MORE DIFFICULT implementations for GEP-1619 because:
+
+    (1) Gateway API session persistence is COMPLETELY UNIMPLEMENTED (issue #6427, open since 2024).
+    (2) Contour does NOT use Envoy's `stateful_session` filter at all — it relies exclusively on
+        RING_HASH consistent hashing for session affinity. GEP-1619 implies strong persistence
+        which requires the stateful_session filter.
+    (3) The Gateway API processor creates DAG objects but does not populate any session
+        affinity fields. The DAG IR itself needs extension for stateful session support.
+    (4) Contour has no policy attachment CRD for Gateway API — no BackendLBPolicy equivalent.
+    (5) The project has limited contributors (issues frequently go stale).
+
+    Contour's native HTTPProxy session affinity is also limited:
+    - Cookie strategy has hardcoded name/TTL/path (issue #2856 open for custom cookie names)
+    - All affinity is soft (RING_HASH) — affinity can be lost when pods scale
+    - No persistent (Permanent) cookies — only session cookies (TTL=0)
+    - Issue #4480 requested stateful_session filter but was closed as stale
+
+    To implement GEP-1619, Contour would need to:
+    1. Add Envoy stateful_session filter support from scratch
+    2. Extend the DAG IR with session persistence fields
+    3. Update gatewayapi_processor.go to read sessionPersistence from route rules
+    4. Add Envoy xDS translation for stateful_session filter (HCM + per-route config)
+    5. Optionally implement BackendLBPolicy CRD
+
+    The existing HTTPProxy Cookie strategy code is NOT reusable for GEP-1619 because it
+    uses a fundamentally different Envoy mechanism (RING_HASH vs stateful_session).
+    However, the existing RING_HASH + hash_policy code could potentially be used for
+    a "soft affinity" interpretation of sessionPersistence if Contour chose to deviate
+    from other implementations.

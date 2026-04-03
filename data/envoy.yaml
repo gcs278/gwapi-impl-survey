@@ -1,0 +1,408 @@
+metadata:
+  name: Envoy
+  type: dataplane_only
+  dataplane: self
+  version_analyzed: "1.33.x (latest stable, April 2026)"
+  repo_url: https://github.com/envoyproxy/envoy
+  docs_url: https://www.envoyproxy.io/docs/envoy/latest/
+  last_updated: 2026-04-03
+
+# Dataplane reports don't have a translation model — they ARE the target.
+# Instead we document what APIs controllers must program.
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Envoy xDS API
+      type: dataplane
+      resources:
+        - "RouteAction.hash_policy[] (cookie, header, source_ip, query_param, filter_state)"
+        - "Cluster.lb_policy (RING_HASH, MAGLEV)"
+        - "envoy.filters.http.stateful_session"
+        - "StatefulSessionPerRoute (typed_per_filter_config)"
+      description: "Envoy's xDS configuration API. Controllers generate this config to program Envoy's session persistence behavior."
+
+native_profile:
+  overview: |
+    Envoy provides two independent session persistence mechanisms with fundamentally different
+    trade-offs. `ConsistentHashLB` uses hash-based load balancing (cookie, header, source IP, or
+    query parameter) with `RING_HASH` or `MAGLEV` algorithms — this provides soft affinity that
+    degrades gracefully (~1/N sessions break when backends change). The `stateful_session` HTTP
+    filter provides strong persistence by encoding the actual backend address (IP:port, base64)
+    into a cookie or header, bypassing the load balancer entirely on subsequent requests.
+
+    These mechanisms operate at different layers of Envoy's config model:
+    `ConsistentHashLB` splits across Route (`hash_policy`) and Cluster (`lb_policy`), while
+    `stateful_session` is an HTTP filter at Listener level with per-route overrides.
+
+    Cookie attributes in Envoy are fully extensible via a generic `CookieAttribute` name/value
+    model — there are no dedicated fields for `Domain`, `Secure`, `HttpOnly`, or `SameSite`,
+    but all can be set via the `attributes[]` array.
+
+  mechanisms:
+    - name: ConsistentHashLB
+      type: soft_affinity
+      description: |
+        Hash-based load balancing using `RouteAction.hash_policy[]` to select what to hash
+        and `Cluster.lb_policy` (`RING_HASH` or `MAGLEV`) to determine how the hash maps to
+        backends. Multiple hash policies can be specified per route and are combined. The
+        `terminal` flag enables fallback chains (e.g. try cookie, fall back to source IP).
+
+        For cookies: if `ttl` is set and the cookie is absent from the request, Envoy
+        auto-generates a `Set-Cookie` response header. `ttl=0` creates a session cookie.
+        If `ttl` is unset and the cookie is absent, no hash is produced.
+
+        This is a two-stage model: `hash_policy` is per-route, `lb_policy` is per-cluster.
+        Multiple routes to the same cluster CAN have different hash policies. If the cluster
+        uses a non-hash LB (e.g. `ROUND_ROBIN`), hash policies are silently ignored.
+      enabled_by_default: false
+      configuration_method: "xDS API (`RouteAction.hash_policy[]` + `Cluster.lb_policy`)"
+
+      config_options:
+        - field: hash_policy[].cookie.name
+          type: string
+          required: true
+          default: null
+          description: "Cookie name to hash on. If `ttl` is set and cookie absent, Envoy generates one."
+          support_level: full
+        - field: hash_policy[].cookie.path
+          type: string
+          required: false
+          default: null
+          description: "Cookie path attribute for generated cookies."
+          support_level: full
+        - field: hash_policy[].cookie.ttl
+          type: duration
+          required: false
+          default: null
+          description: "Cookie TTL. Set = Envoy generates cookie if absent. `0s` = session cookie. Unset = no generation."
+          support_level: full
+        - field: hash_policy[].cookie.attributes[]
+          type: "repeated CookieAttribute {name, value}"
+          required: false
+          default: null
+          description: "Generic cookie attributes. Supports arbitrary attrs: `SameSite`, `Secure`, `HttpOnly`, `Domain`, etc."
+          support_level: full
+        - field: hash_policy[].header.header_name
+          type: string
+          required: true
+          default: null
+          description: "Header name to hash on."
+          support_level: full
+        - field: hash_policy[].header.regex_rewrite
+          type: RegexMatchAndSubstitute
+          required: false
+          default: null
+          description: "Optional regex rewrite on header value before hashing."
+          support_level: full
+        - field: hash_policy[].connection_properties.source_ip
+          type: bool
+          required: false
+          default: false
+          description: "Hash on client source IP address."
+          support_level: full
+        - field: hash_policy[].query_parameter.name
+          type: string
+          required: true
+          default: null
+          description: "URL query parameter name to hash on."
+          support_level: full
+        - field: hash_policy[].filter_state.key
+          type: string
+          required: true
+          default: null
+          description: "Filter state key to hash on (internal Envoy state)."
+          support_level: full
+        - field: hash_policy[].terminal
+          type: bool
+          required: false
+          default: false
+          description: "If true and hash already computed, short-circuit remaining policies. Enables fallback chains."
+          support_level: full
+        - field: Cluster.lb_policy
+          type: "enum (RING_HASH, MAGLEV)"
+          required: true
+          default: null
+          description: "Cluster must use a hash-based LB for `hash_policy` to take effect."
+          support_level: full
+        - field: ring_hash_lb_config.minimum_ring_size
+          type: uint64
+          required: false
+          default: "1024"
+          description: "Minimum ring size for `RING_HASH`. Larger = more even distribution."
+          support_level: full
+        - field: ring_hash_lb_config.maximum_ring_size
+          type: uint64
+          required: false
+          default: "8388608"
+          description: "Maximum ring size. Capped to bound memory usage."
+          support_level: full
+        - field: ring_hash_lb_config.hash_function
+          type: "enum (XX_HASH, MURMUR_HASH_2)"
+          required: false
+          default: XX_HASH
+          description: "Hash function for ring hash. `XX_HASH` is default and recommended."
+          support_level: full
+        - field: maglev_lb_config.table_size
+          type: uint64
+          required: false
+          default: "65537"
+          description: "Maglev table size (must be prime, max 5000011). ~10x faster table construction than ring hash."
+          support_level: full
+        - field: consistent_hashing_lb_config.hash_balance_factor
+          type: uint32
+          required: false
+          default: "0 (unbounded)"
+          description: "Bounds max load per host. Typical range 120-200. Minimum 100 when set."
+          support_level: full
+
+      attachment_model:
+        attaches_to: "Route (hash_policy) + Cluster (lb_policy)"
+        resource_type: "RouteAction + Cluster"
+        scope: "hash_policy is per-route, lb_policy is per-cluster"
+
+    - name: Stateful Session Filter
+      type: strong_persistence
+      description: |
+        HTTP filter (`envoy.filters.http.stateful_session`) that encodes the selected backend's
+        address (IP:port) into a cookie or header. On subsequent requests, the filter decodes the
+        address and bypasses the load balancer to route directly to that backend.
+
+        Cookie values use a protobuf envelope: `base64(proto{address, expires})`. Header values
+        use plain `base64(ip:port)`. The filter is typically added at the HCM (listener) level
+        in a disabled state, then enabled per-route via `StatefulSessionPerRoute` overrides
+        in `Route.typed_per_filter_config`.
+
+        When the target backend is unavailable: if `strict=false` (default), falls back to
+        normal LB and updates the cookie/header. If `strict=true`, returns 503.
+
+        Security: cookie/header values are plain base64 with NO integrity protection (no HMAC
+        or signature). Clients can forge values to target arbitrary backends.
+      enabled_by_default: false
+      configuration_method: "xDS API (`envoy.filters.http.stateful_session` filter + `StatefulSessionPerRoute`)"
+
+      config_options:
+        - field: session_state (cookie)
+          type: CookieBasedSessionState
+          required: false
+          default: null
+          description: "Cookie-based session state. Cookie contains `base64(proto{address, expires})`."
+          support_level: full
+        - field: session_state (header)
+          type: HeaderBasedSessionState
+          required: false
+          default: null
+          description: "Header-based session state. Header contains `base64(ip:port)`."
+          support_level: full
+        - field: cookie.name
+          type: string
+          required: true
+          default: null
+          description: "Cookie name for session state."
+          support_level: full
+        - field: cookie.path
+          type: string
+          required: false
+          default: null
+          description: "Cookie path attribute."
+          support_level: full
+        - field: cookie.ttl
+          type: duration
+          required: false
+          default: null
+          description: "Cookie TTL. `0s` = session cookie. Used inside the proto envelope `expires` field."
+          support_level: full
+        - field: cookie.attributes[]
+          type: "repeated CookieAttribute {name, value}"
+          required: false
+          default: null
+          description: "Same generic cookie attributes as `ConsistentHashLB`. `SameSite`, `Secure`, `HttpOnly`, `Domain`, etc."
+          support_level: full
+        - field: header.name
+          type: string
+          required: true
+          default: null
+          description: "Header name for session state."
+          support_level: full
+        - field: strict
+          type: bool
+          required: false
+          default: false
+          description: "`true` = return 503 when target unavailable. `false` = fall back to normal LB."
+          support_level: full
+
+      attachment_model:
+        attaches_to: "Listener (HCM filter) + Route (per-route override)"
+        resource_type: "HCM http_filters[] + Route.typed_per_filter_config"
+        scope: "filter added at listener level (usually disabled), overridden per-route"
+
+  attachment_points:
+    - mechanism: ConsistentHashLB
+      layer: route_rule
+      native_resource: "RouteAction.hash_policy[]"
+      description: |
+        `hash_policy` is configured per-route on `RouteAction`. It determines WHAT to hash
+        (cookie, header, source IP, etc.). The cluster's `lb_policy` must be `RING_HASH` or
+        `MAGLEV` for the hash to take effect. Multiple routes to the same cluster can have
+        different hash policies.
+    - mechanism: ConsistentHashLB
+      layer: backend_service
+      native_resource: "Cluster.lb_policy"
+      description: |
+        The cluster's `lb_policy` determines HOW the hash is used. `RING_HASH` and `MAGLEV`
+        are the two consistent hashing algorithms. This is per-cluster (per-service), not
+        per-route. Changing the cluster LB policy affects all routes to that cluster.
+    - mechanism: Stateful Session Filter
+      layer: gateway
+      native_resource: "HCM http_filters[]"
+      description: |
+        The `stateful_session` filter is added at the HCM (listener/gateway) level, typically
+        in a disabled state. This makes it available for per-route overrides.
+    - mechanism: Stateful Session Filter
+      layer: route_rule
+      native_resource: "Route.typed_per_filter_config"
+      description: |
+        Per-route overrides enable the filter and configure it with route-specific cookie/header
+        settings via `StatefulSessionPerRoute`. Most specific config wins (route > vhost > HCM).
+
+  # Ingress model mapping: how Envoy's config model maps to the standard
+  # Client → Gateway → Route Rule → Backend/Service → Endpoint model
+  ingress_model_mapping:
+    client:
+      envoy_concept: "Downstream connection"
+      description: "The client connecting to Envoy's listener."
+    gateway:
+      envoy_concept: "Listener + HCM (HttpConnectionManager)"
+      description: |
+        A Listener binds to an address:port. The HCM is an L7 network filter within the
+        listener that handles HTTP routing. The `stateful_session` filter lives here as an
+        HTTP filter (usually disabled).
+      session_persistence_config:
+        - "`http_filters[].stateful_session` — added here, disabled by default"
+    route_rule:
+      envoy_concept: "Route (within VirtualHost within RouteConfiguration)"
+      description: |
+        Routes match requests by path/headers/etc. and specify actions. Session persistence
+        config lives here for both mechanisms.
+      session_persistence_config:
+        - "`RouteAction.hash_policy[]` — specifies what to hash for `ConsistentHashLB`"
+        - "`Route.typed_per_filter_config[stateful_session]` — per-route override for stateful session"
+    backend_service:
+      envoy_concept: "Cluster"
+      description: |
+        A Cluster represents a group of upstream endpoints. The LB algorithm is configured
+        here. For `ConsistentHashLB`, the cluster must use `RING_HASH` or `MAGLEV`.
+      session_persistence_config:
+        - "`Cluster.lb_policy` = `RING_HASH` or `MAGLEV`"
+        - "`ring_hash_lb_config` / `maglev_lb_config` — tuning parameters"
+    endpoint:
+      envoy_concept: "Endpoint (within ClusterLoadAssignment)"
+      description: |
+        Individual upstream host (IP:port). For `stateful_session`, the endpoint address is
+        encoded into the cookie/header value. For `ConsistentHashLB`, endpoints are placed
+        on the hash ring.
+
+  dataplane_translation:
+    description: |
+      Envoy is the dataplane — there is no further translation. Controllers program Envoy
+      via xDS (gRPC or REST) or static config (YAML/JSON). Session persistence requires
+      coordinating config across multiple Envoy resources:
+
+      `ConsistentHashLB`:
+        Route: `RouteAction.hash_policy[]` → what to hash
+        Cluster: `lb_policy` = `RING_HASH`/`MAGLEV` → how to hash
+        Both must be set. If the cluster uses non-hash LB, hash policies are silently ignored.
+
+      `Stateful Session`:
+        Listener: HCM `http_filters[]` → add filter (disabled)
+        Route: `typed_per_filter_config` → enable + configure per-route
+        The filter handles everything — no cluster config needed.
+    envoy_features_used:
+      - "RouteAction.hash_policy[] (cookie, header, connection_properties, query_parameter, filter_state)"
+      - "Cluster.lb_policy: RING_HASH, MAGLEV"
+      - "ring_hash_lb_config, maglev_lb_config"
+      - "consistent_hashing_lb_config (hash_balance_factor)"
+      - "envoy.filters.http.stateful_session (cookie or header session state)"
+      - "StatefulSessionPerRoute (typed_per_filter_config override)"
+      - "CookieBasedSessionState, HeaderBasedSessionState"
+      - "type.http.v3.Cookie (name, path, ttl, attributes[])"
+      - "type.http.v3.CookieAttribute (generic name/value pairs)"
+    key_code_paths:
+      - "api/envoy/config/route/v3/route_components.proto — RouteAction.hash_policy"
+      - "api/envoy/extensions/filters/http/stateful_session/v3/stateful_session.proto"
+      - "api/envoy/extensions/http/stateful_session/cookie/v3/cookie.proto"
+      - "api/envoy/extensions/http/stateful_session/header/v3/header.proto"
+      - "api/envoy/type/http/v3/cookie.proto — Cookie, CookieAttribute"
+      - "source/extensions/filters/http/stateful_session/ — filter implementation"
+    flow: |
+      ConsistentHashLB:
+        RouteAction.hash_policy[].cookie{name,path,ttl,attributes[]}
+          → compute hash from cookie value (or generate cookie if absent + ttl set)
+        RouteAction.hash_policy[].header{header_name}
+          → compute hash from header value
+        RouteAction.hash_policy[].connection_properties{source_ip}
+          → compute hash from client IP
+        → combined hash → Cluster.lb_policy (RING_HASH or MAGLEV) → select endpoint
+
+      Stateful Session:
+        Request: check cookie/header → base64 decode → extract ip:port
+          → override LB selection → route to specific endpoint
+        Response: encode selected endpoint ip:port → base64
+          → set cookie/header for subsequent requests
+        Fallback: if target unavailable and strict=false → normal LB
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: true
+    source_ip_affinity: true
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true
+      path: true
+      domain: true        # Via CookieAttribute{name:"Domain", value:"example.com"}
+      ttl: true
+      secure: true        # Via CookieAttribute{name:"Secure"}
+      http_only: true     # Via CookieAttribute{name:"HttpOnly"}
+      same_site: true     # Via CookieAttribute{name:"SameSite", value:"Strict"}
+    idle_timeout: false
+    absolute_timeout: false   # TTL is cookie expiry, not server-side timeout
+    lifetime_type_session: true   # ttl=0 creates session cookie
+    lifetime_type_permanent: true  # ttl>0 creates permanent cookie
+
+  limitations:
+    - "No server-side session tracking — all state is in the client (cookie/header value)"
+    - "No idle timeout — only client-side TTL (cookie expiry)"
+    - "`stateful_session` cookie/header values have NO integrity protection (no HMAC/signature) — clients can forge values to target arbitrary backends"
+    - "`ConsistentHashLB` is soft affinity — adding/removing backends breaks ~1/N sessions"
+    - "`ConsistentHashLB` requires coordinating config across Route (`hash_policy`) and Cluster (`lb_policy`) — if mismatched, hash is silently ignored"
+    - "Cookie attributes (`Domain`, `Secure`, `SameSite`, etc.) use generic `CookieAttribute` name/value pairs, not dedicated fields — controllers must generate the right attribute names"
+    - "`MAGLEV` is ~2x less stable than `RING_HASH` on membership changes"
+    - "`StatefulSessionPerRoute` does not emit statistics (only filter-level `stat_prefix` works)"
+    - "`stateful_session` cookie uses protobuf envelope — cookie values are opaque and larger than plain base64"
+
+  known_issues: []
+
+# Dataplanes don't implement Gateway API, so no gwapi_assessment.
+# Instead, we document which implementations use this dataplane and how.
+downstream_implementations:
+  - name: Istio
+    uses_mechanisms:
+      - ConsistentHashLB
+      - Stateful Session Filter
+    notes: "Uses both mechanisms. `ConsistentHashLB` via `DestinationRule`, `StatefulSession` via Service labels (experimental)."
+  - name: Envoy Gateway
+    uses_mechanisms:
+      - Stateful Session Filter
+    notes: "Uses only `stateful_session` filter. Does NOT use `ConsistentHashLB` for session persistence."
+  - name: Contour
+    uses_mechanisms:
+      - ConsistentHashLB
+    notes: "Uses `ConsistentHashLB` via `HTTPProxy` CRD's `loadBalancerPolicy`."
+  - name: Emissary-Ingress
+    uses_mechanisms:
+      - ConsistentHashLB
+    notes: "Uses `ConsistentHashLB` via `Mapping` CRD's `load_balancer.policy: ring_hash`."
+  - name: kgateway
+    uses_mechanisms:
+      - ConsistentHashLB
+      - Stateful Session Filter
+    notes: "Uses both mechanisms. `StatefulSession` via Gateway API `sessionPersistence` field. `ConsistentHashLB` via `BackendConfigPolicy` CRD."

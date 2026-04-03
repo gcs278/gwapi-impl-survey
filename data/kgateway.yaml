@@ -1,0 +1,498 @@
+metadata:
+  name: kgateway
+  type: controller
+  dataplane: Envoy
+  version_analyzed: "main branch (post v2.1), April 2026"
+  repo_url: https://github.com/kgateway-dev/kgateway
+  docs_url: https://kgateway.dev/docs/
+  last_updated: 2026-04-03
+
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute.rule.sessionPersistence"
+        - "GRPCRoute.rule.sessionPersistence"
+      description: |
+        User-facing API. kgateway reads sessionPersistence directly from HTTPRoute and GRPCRoute
+        rules. For consistent hashing (soft affinity), kgateway uses its own BackendConfigPolicy CRD
+        rather than Gateway API fields.
+    - name: kgateway CRDs (for consistent hashing only)
+      type: intermediate
+      resources:
+        - "BackendConfigPolicy (gateway.kgateway.dev/v1alpha1)"
+      description: |
+        BackendConfigPolicy provides consistent hashing (soft session affinity) via loadBalancer
+        config with RingHash or Maglev algorithms. This is NOT used for strong session persistence —
+        that comes directly from Gateway API's sessionPersistence field. BackendConfigPolicy targets
+        Services, not routes.
+    - name: Envoy xDS
+      type: dataplane
+      resources:
+        - "envoy.filters.http.stateful_session (cookie or header)"
+        - "StatefulSessionPerRoute (typed_per_filter_config)"
+        - "envoy.load_balancing_policies.ring_hash"
+        - "envoy.load_balancing_policies.maglev"
+        - "ConsistentHashingLbConfig (hash_policy)"
+      description: "Envoy's configuration delivered via xDS. stateful_session filter for strong persistence, RingHash/Maglev LB policies for soft affinity."
+
+native_profile:
+  overview: |
+    kgateway (formerly Gloo Gateway, now a CNCF incubated project by Solo.io) is an Envoy-based
+    Gateway API controller built on KRT (Kubernetes Declarative Controller Runtime from Istio) with
+    a plugin-based architecture. It implements TWO distinct session affinity mechanisms:
+
+    1. **Strong session persistence** (via Gateway API `sessionPersistence` field):
+       Translates `HTTPRoute.rule.sessionPersistence` and `GRPCRoute.rule.sessionPersistence`
+       directly into Envoy's `stateful_session` HTTP filter. This encodes the backend address into
+       a cookie or header, providing guaranteed persistence. Implemented in the "builtin plugin"
+       (`pkg/krtcollections/builtin.go`). Added in PR #11320, released with v2.1.
+
+    2. **Soft session affinity** (via `BackendConfigPolicy` CRD):
+       Uses the `BackendConfigPolicy` (gateway.kgateway.dev/v1alpha1) CRD to configure consistent
+       hashing with RingHash or Maglev algorithms. Hash policies can be based on headers, cookies,
+       or source IP. This targets Services (not routes) and provides best-effort affinity that may
+       be lost when backends scale. Implemented in the backendconfigpolicy plugin
+       (`pkg/kgateway/extensions2/plugins/backendconfigpolicy/lb.go`).
+
+    kgateway does NOT have a `sessionPersistence` field on its own TrafficPolicy CRD — strong
+    session persistence is exclusively configured via Gateway API's inline `sessionPersistence`
+    field on route rules. The TrafficPolicy CRD handles other concerns like transformation,
+    ext-auth, rate limiting, CORS, etc.
+
+    kgateway's architecture uses a 3-stage translation pipeline:
+      1. Policy -> IR: Plugins translate CRDs to PolicyIR (close to Envoy protos)
+      2. HTTPRoute/Gateway -> IR with Policies Attached: Core aggregates routes and performs
+         policy attachment via targetRefs
+      3. IR -> xDS: Translates to Envoy config via plugin NewGatewayTranslationPass functions
+
+    For session persistence specifically, the translation is handled by the builtin plugin which
+    converts Gateway API's `SessionPersistence` struct directly into Envoy's
+    `StatefulSessionPerRoute` proto — no intermediate IR layer.
+
+  mechanisms:
+    - name: Stateful Session Filter (Strong Persistence)
+      type: strong_persistence
+      description: |
+        Uses Envoy's `envoy.filters.http.stateful_session` filter to encode the actual backend
+        address into a cookie or header. On subsequent requests, the filter bypasses the load
+        balancer entirely and routes to the exact same backend. The filter is added at the HCM
+        (listener) level in a DISABLED state, then overridden per-route via `TypedPerFilterConfig`
+        to enable it with route-specific settings. This is the "session persistence" mechanism.
+      enabled_by_default: false
+      configuration_method: "Gateway API field (HTTPRoute.rule.sessionPersistence or GRPCRoute.rule.sessionPersistence)"
+
+      config_options:
+        - field: sessionPersistence.type
+          type: "enum (Cookie, Header)"
+          required: false
+          default: Cookie
+          description: "Session persistence type — Cookie (default) or Header."
+          support_level: full
+        - field: sessionPersistence.sessionName
+          type: string
+          required: false
+          default: "'sessionPersistence' for cookies, 'x-session-persistence' for headers"
+          description: |
+            Name for the cookie or header. If not specified, defaults to 'sessionPersistence'
+            (for cookies) or 'x-session-persistence' (for headers). The name is sanitized
+            via SanitizeCookieName() or SanitizeHeaderName() utility functions.
+          support_level: full
+        - field: sessionPersistence.absoluteTimeout
+          type: duration
+          required: false
+          default: "1 year (365 days) for Permanent cookies when no absoluteTimeout is set"
+          description: |
+            Maps to cookie TTL. For Permanent cookies without absoluteTimeout, defaults to 1 year.
+            For Session cookies, the TTL is set to nil (session-scoped). Parsed via Go's
+            time.ParseDuration.
+          support_level: full
+        - field: sessionPersistence.idleTimeout
+          type: duration
+          required: false
+          default: null
+          description: "NOT SUPPORTED — explicitly documented as unsupported in Envoy-based gateway proxies. Setting this value has no effect."
+          support_level: none
+        - field: cookieConfig.lifetimeType
+          type: "enum (Session, Permanent)"
+          required: false
+          default: null
+          description: |
+            Session = session cookie (TTL set to nil, cookie deleted when browser session ends).
+            Permanent = persistent cookie (uses absoluteTimeout for TTL, defaults to 1 year if
+            absoluteTimeout not specified).
+          support_level: full
+
+      attachment_model:
+        attaches_to: Route Rule
+        resource_type: "HTTPRoute.rule.sessionPersistence / GRPCRoute.rule.sessionPersistence"
+        scope: "per-route-rule"
+
+    - name: Consistent Hashing (Soft Affinity)
+      type: soft_affinity
+      description: |
+        Uses Envoy's RingHash or Maglev consistent hashing load balancing algorithms to provide
+        soft session affinity. Requests with the same hash key (header, cookie, or source IP) are
+        routed to the same backend, but affinity may be lost when backends scale or the gateway
+        restarts. Configured via BackendConfigPolicy CRD targeting Services.
+      enabled_by_default: false
+      configuration_method: "BackendConfigPolicy CRD (gateway.kgateway.dev/v1alpha1)"
+
+      config_options:
+        - field: loadBalancer.ringHash.minimumRingSize
+          type: integer
+          required: false
+          default: "1024"
+          description: "Minimum number of hashes per host in the ring. Larger values improve distribution but use more memory."
+          support_level: full
+        - field: loadBalancer.ringHash.maximumRingSize
+          type: integer
+          required: false
+          default: "8M"
+          description: "Maximum ring capacity."
+          support_level: full
+        - field: loadBalancer.ringHash.hashPolicies
+          type: "array of HashPolicy"
+          required: false
+          default: null
+          description: "List of hash policies. Each policy specifies one of: header, cookie, or sourceIP. Multiple policies can be chained with terminal flag."
+          support_level: full
+        - field: loadBalancer.maglev.hashPolicies
+          type: "array of HashPolicy"
+          required: false
+          default: null
+          description: "Same hash policies as RingHash but using Maglev's fixed 65,357-entry lookup table."
+          support_level: full
+        - field: hashPolicies[].header.name
+          type: string
+          required: false
+          default: null
+          description: "Hash on a specific request header value."
+          support_level: full
+        - field: hashPolicies[].cookie.name
+          type: string
+          required: false
+          default: null
+          description: "Hash on a specific cookie value. Supports TTL, path, httpOnly, secure, sameSite attributes."
+          support_level: full
+        - field: hashPolicies[].sourceIP
+          type: object
+          required: false
+          default: null
+          description: "Hash on the client's source IP address."
+          support_level: full
+        - field: hashPolicies[].terminal
+          type: bool
+          required: false
+          default: false
+          description: "If true, skip subsequent hash policies when this one matches."
+          support_level: full
+        - field: loadBalancer.closeConnectionsOnHostSetChange
+          type: bool
+          required: false
+          default: false
+          description: "Drain existing connections when the backend pool topology changes."
+          support_level: full
+        - field: loadBalancer.ringHash.useHostnameForHashing
+          type: bool
+          required: false
+          default: false
+          description: "Use hostname instead of resolved IP for hashing. Only supported for strict DNS clusters."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "BackendConfigPolicy"
+        scope: "per-service (targets Kubernetes Service, Backend, or Istio Hostname)"
+
+  attachment_points:
+    - mechanism: Stateful Session Filter (Strong Persistence)
+      layer: route_rule
+      native_resource: "HTTPRoute.rule.sessionPersistence / GRPCRoute.rule.sessionPersistence"
+      description: |
+        Strong session persistence is configured inline on HTTPRoute and GRPCRoute rules via the
+        Gateway API sessionPersistence field. The builtin plugin reads the sessionPersistence field
+        from each route rule, converts it to Envoy's StatefulSessionPerRoute proto, and applies it
+        per-route via TypedPerFilterConfig. There is no service-level or gateway-level attachment
+        for strong persistence — only route-inline via Gateway API.
+    - mechanism: Consistent Hashing (Soft Affinity)
+      layer: backend_service
+      native_resource: "BackendConfigPolicy (gateway.kgateway.dev/v1alpha1)"
+      description: |
+        Soft session affinity via consistent hashing is configured per-service via BackendConfigPolicy.
+        The CRD targets Services using targetRefs and configures RingHash or Maglev load balancing
+        with hash policies (header, cookie, or source IP). This is applied at the Envoy cluster level,
+        affecting all routes that target the service.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "implemented"
+      dataplane_target:
+        name: "stateful_session filter"
+        label: "generates"
+    btp:
+      target_layer: backend_service
+      label: "not implemented"
+      dataplane_target:
+        name: "stateful_session filter"
+        label: "would generate"
+
+  dataplane_translation:
+    description: |
+      kgateway reads Gateway API sessionPersistence directly from HTTPRoute and GRPCRoute rules
+      and translates it into Envoy xDS configuration. The translation is handled by the builtin
+      plugin in the krtcollections package. For GRPCRoute, the session persistence field is copied
+      into an HTTPRoute-equivalent rule structure before processing.
+
+      Translation pipeline for strong session persistence:
+      1. `builtin.go` reads `rule.SessionPersistence` from Gateway API HTTPRoute/GRPCRoute
+      2. If experimental features flag (`KGW_ENABLE_GATEWAY_API_EXPERIMENTAL_FEATURES`) is enabled,
+         calls `convertSessionPersistence()` to create a `StatefulSessionPerRoute` proto directly
+      3. If experimental features are DISABLED, logs a warning and skips the config
+      4. During route translation, the `StatefulSessionPerRoute` is set as `TypedPerFilterConfig`
+         on the Envoy route under the `envoy.filters.http.stateful_session` filter name
+      5. The builtin plugin tracks which filter chains need the stateful session filter via
+         `needStatefulSession` map, and adds a DISABLED `StatefulSession` filter to the HCM
+         http_filters list for those filter chains
+      6. Per-route TypedPerFilterConfig overrides the disabled filter with the actual session config
+
+      Translation pipeline for consistent hashing (soft affinity):
+      1. `backendconfigpolicy/lb.go` reads `BackendConfigPolicy.spec.loadBalancer`
+      2. Translates to `LoadBalancerConfigIR` containing Envoy's `LoadBalancingPolicy` proto
+      3. For RingHash/Maglev, constructs `ConsistentHashingLbConfig` with `HashPolicy` entries
+      4. Applied to Envoy cluster config via `applyLoadBalancerConfig()`
+    envoy_features_used:
+      - "envoy.filters.http.stateful_session (HCM-level, disabled by default)"
+      - "StatefulSessionPerRoute (per-route override via typed_per_filter_config)"
+      - "CookieBasedSessionState (envoy.http.stateful_session.cookie)"
+      - "HeaderBasedSessionState (envoy.http.stateful_session.header)"
+      - "envoy.load_balancing_policies.ring_hash"
+      - "envoy.load_balancing_policies.maglev"
+      - "ConsistentHashingLbConfig with HashPolicy (header, cookie, source IP)"
+      - "envoy.load_balancing_policies.least_request (default LB)"
+      - "envoy.load_balancing_policies.round_robin"
+      - "envoy.load_balancing_policies.random"
+    key_code_paths:
+      - "pkg/krtcollections/builtin.go — convertSessionPersistence(), ruleIR struct, stateful session filter injection"
+      - "pkg/krtcollections/grpc_route.go — GRPCRoute session persistence mapping to HTTPRoute equivalent"
+      - "pkg/kgateway/extensions2/plugins/backendconfigpolicy/lb.go — translateLoadBalancerConfig(), buildRingHashPolicy(), buildMaglevPolicy(), constructHashPolicy()"
+      - "api/v1alpha1/kgateway/backend_config_policy_types.go — LoadBalancer, LoadBalancerRingHashConfig, LoadBalancerMaglevConfig, HashPolicy types"
+      - "api/v1alpha1/kgateway/traffic_policy_types.go — TrafficPolicy spec (no session persistence fields)"
+      - "pkg/kgateway/utils/sanitize.go — SanitizeCookieName(), SanitizeHeaderName()"
+    flow: |
+      Strong Session Persistence:
+        HTTPRoute.rule.sessionPersistence / GRPCRoute.rule.sessionPersistence
+          -> builtin.go: convertSessionPersistence()
+            -> StatefulSessionPerRoute {
+                 StatefulSession {
+                   SessionState: CookieBasedSessionState{cookie.name, cookie.ttl}
+                              OR HeaderBasedSessionState{name}
+                 }
+               }
+          -> builtin.go: apply to Envoy Route typed_per_filter_config[envoy.filters.http.stateful_session]
+          -> builtin.go: add disabled StatefulSession filter to HCM http_filters (if any route needs it)
+
+      Soft Session Affinity (Consistent Hashing):
+        BackendConfigPolicy.spec.loadBalancer.ringHash/maglev
+          -> lb.go: translateLoadBalancerConfig()
+            -> buildRingHashPolicy() / buildMaglevPolicy()
+              -> LoadBalancingPolicy { RingHash/Maglev { ConsistentHashingLbConfig { HashPolicy[] } } }
+          -> lb.go: applyLoadBalancerConfig()
+            -> Envoy Cluster load_balancing_policy
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: true
+    source_ip_affinity: true   # Via BackendConfigPolicy consistent hashing (soft affinity only)
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true
+      path: false    # Not configurable for session persistence; configurable for consistent hash cookies
+      domain: false
+      ttl: true      # Via absoluteTimeout
+      secure: false  # Not for session persistence; available for consistent hash cookies
+      http_only: false  # Not for session persistence; available for consistent hash cookies
+      same_site: false  # Not for session persistence; available for consistent hash cookies
+    idle_timeout: false   # Documented as unsupported in Envoy-based proxies
+    absolute_timeout: true
+    lifetime_type_session: true
+    lifetime_type_permanent: true
+
+  limitations:
+    - "No `idleTimeout` support — documented as unsupported in Envoy-based gateway proxies, setting it has no effect"
+    - "No session persistence on kgateway's own TrafficPolicy CRD — strong persistence is route-inline only via Gateway API"
+    - "Cookie path is not configurable for session persistence (no routePathToCookiePath like Envoy Gateway)"
+    - "Cookie domain, Secure, HttpOnly, SameSite attributes not available for session persistence cookies (only for consistent hash cookies via BackendConfigPolicy)"
+    - "Stateful session encodes backend address in cookie — security concern (clients can observe/target specific backends)"
+    - "Consistent hashing (soft affinity) may lose affinity when backends scale or gateway restarts"
+    - "Requires experimental Gateway API features flag (KGW_ENABLE_GATEWAY_API_EXPERIMENTAL_FEATURES=true)"
+    - "Requires experimental channel Gateway API CRDs (v1.3+)"
+    - "No session name auto-generation from route metadata — uses static defaults ('sessionPersistence' or 'x-session-persistence')"
+    - "Session persistence was added relatively recently (PR #11320, post-v2.1) — less battle-tested than other features"
+
+  known_issues:
+    - url: "https://github.com/kgateway-dev/kgateway/issues/10461"
+      description: "Original issue reporting that sessionPersistence on HTTPRoutes was not working. Fixed by PR #11320."
+    - url: "https://github.com/kgateway-dev/kgateway/issues/11162"
+      description: "Tracking issue for session persistence feature implementation."
+
+gwapi_assessment:
+  overview: |
+    kgateway has IMPLEMENTED Gateway API route-inline session persistence for both HTTPRoute and
+    GRPCRoute. The implementation was added in PR #11320 ("feat: gateway api persistent session")
+    and uses Envoy's `stateful_session` filter for strong persistence.
+
+    kgateway's architecture is well-suited for Gateway API session persistence because:
+    1. It already reads `sessionPersistence` directly from Gateway API route rules
+    2. It uses the same Envoy `stateful_session` filter as Envoy Gateway
+    3. Its plugin architecture allows clean separation of session persistence from other concerns
+    4. GRPCRoute support was included from the initial implementation
+
+    For consistent hashing (soft affinity), kgateway uses its own `BackendConfigPolicy` CRD
+    which targets Services. This is a separate mechanism from GEP-1619's session persistence
+    and aligns more with potential future "session affinity" (weak) standardization.
+
+    kgateway also supports combining both mechanisms: session persistence for clients with an
+    established session, and consistent hashing as the fallback load balancing for new clients.
+
+  route_inline:
+    difficulty: trivial
+    description: |
+      Route-inline session persistence is ALREADY IMPLEMENTED for both HTTPRoute and GRPCRoute.
+      kgateway reads `rule.sessionPersistence` directly from Gateway API route resources and
+      translates it to Envoy's `stateful_session` filter. Both Cookie and Header types are
+      supported. The implementation uses the builtin plugin's `convertSessionPersistence()`
+      function which directly constructs `StatefulSessionPerRoute` Envoy protos.
+    mapping_strategy: |
+      Direct translation: `HTTPRoute.rule.sessionPersistence` -> `StatefulSessionPerRoute` proto
+      -> Envoy route `typed_per_filter_config[envoy.filters.http.stateful_session]`.
+      No intermediate IR layer — the builtin plugin constructs Envoy protos directly from
+      Gateway API types. GRPCRoute support works by copying the `SessionPersistence` field into
+      an HTTPRoute-equivalent rule structure.
+    gotchas:
+      - "Requires `KGW_ENABLE_GATEWAY_API_EXPERIMENTAL_FEATURES=true` env var on the controller"
+      - "Requires experimental channel Gateway API CRDs (v1.3+)"
+      - "`idleTimeout` is silently ignored — no error, no warning, just no effect"
+      - "Default session name for cookies is 'sessionPersistence' (not auto-generated from route metadata)"
+      - "Default session name for headers is 'x-session-persistence'"
+      - "Permanent cookies without absoluteTimeout default to 1-year TTL"
+      - "Cookie path is not set by kgateway (unlike Envoy Gateway which computes path from route match)"
+      - "Session name uniqueness validation is NOT implemented — relies on Gateway API-level validation"
+    code_changes_needed:
+      - "None for basic support — already implemented"
+      - "May need updates as GEP-1619 fields evolve (e.g., new cookie attributes, session name semantics)"
+      - "Could add cookie path computation from route matches (currently not implemented)"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      kgateway does not have a `sessionPersistence` field on any of its own CRDs (TrafficPolicy,
+      BackendConfigPolicy, etc.). BackendConfigPolicy has `loadBalancer` for consistent hashing
+      but not for strong session persistence.
+
+      Adding BackendLBPolicy-style session persistence would require:
+      1. Adding a `sessionPersistence` field to `BackendConfigPolicy` (which already targets Services)
+         OR implementing Gateway API's `BackendLBPolicy`
+      2. Translating the field to the same `stateful_session` filter config
+      3. Handling precedence between service-level and route-inline session persistence
+
+      The translation itself would be straightforward since kgateway already has the
+      `convertSessionPersistence()` code. The main work would be integrating it into the
+      BackendConfigPolicy plugin and handling the different attachment model (service-level vs
+      route-level).
+
+      Note: kgateway's BackendConfigPolicy targets Services/Backends/Istio Hostnames — this
+      aligns well with GEP-1619's BackendLBPolicy which also targets Services.
+    mapping_strategy: |
+      Option A: Add `sessionPersistence` to `BackendConfigPolicySpec` -> reuse
+      `convertSessionPersistence()` -> apply stateful_session filter at service level.
+      Option B: Implement Gateway API's BackendLBPolicy directly -> same translation.
+
+      Either approach would reuse the existing stateful_session translation code.
+      BackendConfigPolicy is the natural home since it already targets Services and has
+      load balancer configuration.
+    gotchas:
+      - "BackendConfigPolicy targets Services — aligns with GEP-1619's BTP-to-Service model"
+      - "Precedence between BackendConfigPolicy session persistence and route-inline needs definition"
+      - "Cookie path computation differs — BackendConfigPolicy has no route path match context"
+      - "Session name uniqueness across BackendConfigPolicy and route-inline would need cross-resource validation"
+      - "BackendConfigPolicy already has loadBalancer for soft affinity — adding strong persistence to same CRD could be confusing"
+    code_changes_needed:
+      - "api/v1alpha1/kgateway/backend_config_policy_types.go — add SessionPersistence field"
+      - "pkg/kgateway/extensions2/plugins/backendconfigpolicy/ — translate SessionPersistence to stateful_session filter"
+      - "Handle precedence: route-inline sessionPersistence should override BackendConfigPolicy-level"
+      - "Add validation for sessionPersistence in BackendConfigPolicy context"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "CookieBasedSessionState (envoy.http.stateful_session.cookie)"
+      mapping_difficulty: direct
+      notes: "Default type. Direct mapping to Envoy's cookie-based stateful_session."
+    - gwapi_field: "type: Header"
+      native_field: "HeaderBasedSessionState (envoy.http.stateful_session.header)"
+      mapping_difficulty: direct
+      notes: "Direct mapping to Envoy's header-based stateful_session."
+    - gwapi_field: "sessionName"
+      native_field: "Cookie.Name (sanitized) or Header.Name (sanitized)"
+      mapping_difficulty: direct
+      notes: "Maps directly. Sanitized via SanitizeCookieName() or SanitizeHeaderName(). Defaults to 'sessionPersistence' / 'x-session-persistence'."
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: "Cookie with TTL=nil"
+      mapping_difficulty: direct
+      notes: "Session cookies — TTL is explicitly set to nil, deleted when browser session ends."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: "Cookie with TTL from absoluteTimeout (or 1-year default)"
+      mapping_difficulty: direct
+      notes: "Permanent cookies use absoluteTimeout for TTL. If no absoluteTimeout, defaults to 365 days."
+    - gwapi_field: "absoluteTimeout"
+      native_field: "Cookie.Ttl (durationpb.Duration)"
+      mapping_difficulty: direct
+      notes: "Parsed via Go time.ParseDuration. Applied to cookie TTL. For Session lifetime, overridden to nil."
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "Documented as unsupported in Envoy-based gateway proxies. Silently ignored (no error)."
+    - gwapi_field: "cookie path (not in spec)"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "kgateway does NOT compute cookie path from route matches (unlike Envoy Gateway). Cookie path is not set."
+
+  deviations:
+    - "kgateway's TrafficPolicy CRD has no sessionPersistence field — only route-inline via Gateway API"
+    - "BackendConfigPolicy has loadBalancer for consistent hashing but no strong session persistence"
+    - "idleTimeout is silently ignored rather than rejected with an error (unlike Envoy Gateway)"
+    - "sessionName defaults are static strings, not auto-generated from route metadata"
+    - "Cookie path is not computed from route matches — left unset (Envoy default behavior)"
+    - "Permanent cookies default to 1-year TTL when absoluteTimeout is not specified"
+    - "GRPCRoute session persistence is supported (not all implementations support this)"
+    - "Consistent hashing (soft affinity) is a separate mechanism via BackendConfigPolicy, not part of session persistence"
+    - "kgateway supports combining session persistence + consistent hashing for layered affinity"
+
+  overall_difficulty: trivial
+  summary: |
+    kgateway is one of the easier implementations for GEP-1619 because:
+    (1) Route-inline session persistence is ALREADY IMPLEMENTED for both HTTPRoute and GRPCRoute.
+    (2) kgateway uses Envoy's stateful_session filter (strong persistence), aligning with
+        GEP-1619's definition of session persistence as "strong."
+    (3) Direct translation model — the builtin plugin constructs Envoy protos directly from
+        Gateway API types with no intermediate API.
+    (4) GRPCRoute support is included from the initial implementation.
+    (5) BackendConfigPolicy already targets Services and has load balancer config, making it a
+        natural home for service-level session persistence (BackendLBPolicy).
+
+    The main gaps are:
+    - No BackendLBPolicy / service-level session persistence yet (only route-inline)
+    - idleTimeout is not supported (Envoy limitation)
+    - Cookie path is not computed from route matches
+    - No cookie attributes beyond name and TTL for session persistence
+    - Requires experimental features flag
+
+    kgateway also has a clean separation between strong persistence (Gateway API
+    sessionPersistence -> stateful_session filter) and soft affinity (BackendConfigPolicy ->
+    consistent hashing), which maps well to GEP-1619's distinction between session persistence
+    and session affinity. The two can be combined: BackendConfigPolicy provides the default
+    hashing-based affinity, while route-inline sessionPersistence provides guaranteed persistence
+    for clients with established sessions.

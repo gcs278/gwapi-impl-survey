@@ -1,0 +1,397 @@
+metadata:
+  name: NGINX Gateway Fabric
+  type: controller
+  dataplane: Nginx
+  version_analyzed: "main branch (April 2026), post v2.4.0"
+  repo_url: https://github.com/nginxinc/nginx-gateway-fabric
+  docs_url: https://docs.nginx.com/nginx-gateway-fabric/
+  last_updated: 2026-04-02
+
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "`HTTPRoute.rule.sessionPersistence`"
+        - "`GRPCRoute.rule.sessionPersistence`"
+        - "`UpstreamSettingsPolicy` (custom CRD for `ip_hash`)"
+      description: "User-facing API. NGF directly consumes `sessionPersistence` fields — no intermediate API layer."
+    - name: nginx.conf
+      type: dataplane
+      resources:
+        - "`upstream { sticky cookie ...; }`"
+        - "`upstream { ip_hash; }`"
+        - "`location { proxy_pass ...; }`"
+      description: "Generated nginx configuration files. NGF renders Go templates into `nginx.conf` and triggers a reload."
+
+native_profile:
+  overview: |
+    NGINX Gateway Fabric (NGF) is a Gateway API controller that programs NGINX as its dataplane.
+    It supports both NGINX OSS and NGINX Plus. Session persistence support was implemented in
+    v2.4.0 (Dec 2025) using two distinct mechanisms depending on the NGINX variant:
+
+    1. Cookie-based persistence (Plus only): Uses NGINX Plus's `sticky cookie` directive, configured
+       via the Gateway API's `sessionPersistence` field on `HTTPRoute`/`GRPCRoute` rules. This provides
+       strong session persistence where NGINX Plus generates and tracks cookies to pin clients to
+       specific backends.
+
+    2. IP hash affinity (OSS and Plus): Uses NGINX's `ip_hash` load balancing directive, configured
+       via NGF's custom `UpstreamSettingsPolicy` CRD. This provides soft source-IP affinity where
+       requests from the same client IP are consistently routed to the same backend.
+
+    NGF consumes the Gateway API `SessionPersistence` spec directly at the route rule level for
+    cookie-based persistence (Plus), making it one of the most complete Gateway API session
+    persistence implementations. For OSS, the `UpstreamSettingsPolicy` provides `ip_hash` as the
+    only option since NGINX OSS has no cookie persistence directive.
+
+  mechanisms:
+    - name: StickyCoookie
+      type: strong_persistence
+      description: |
+        NGINX Plus's `sticky cookie` directive generates a session cookie containing an upstream
+        server identifier. On subsequent requests, NGINX Plus reads the cookie and routes to the
+        same backend, bypassing the load balancer. This provides strong persistence that survives
+        backend scaling as long as the pinned backend is alive. Configured via the Gateway API
+        `SessionPersistence` field on `HTTPRoute`/`GRPCRoute` rules.
+      enabled_by_default: false
+      configuration_method: "Gateway API `HTTPRoute`/`GRPCRoute` `rule.sessionPersistence` field"
+
+      config_options:
+        - field: sessionPersistence.sessionName
+          type: string
+          required: false
+          default: "auto-generated sp_{namespace}__{name}_rule{idx}"
+          description: "Cookie name for session persistence. Auto-generated with `sp_` prefix if not specified."
+          support_level: full
+        - field: sessionPersistence.type
+          type: enum
+          required: true
+          default: null
+          description: "Must be `Cookie`. Only cookie-based persistence is supported."
+          support_level: full
+        - field: sessionPersistence.absoluteTimeout
+          type: duration
+          required: false
+          default: null
+          description: "Maps to `sticky cookie` `expires` parameter. Controls cookie expiration."
+          support_level: full
+        - field: sessionPersistence.cookieConfig.lifetimeType
+          type: enum
+          required: false
+          default: null
+          description: "`Permanent` = cookie has `expires` value. `Session` = no `expires` (browser session cookie)."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Route Rule
+        resource_type: "`HTTPRoute`/`GRPCRoute` `rule.sessionPersistence`"
+        scope: "per-route-rule (each rule can have its own session persistence config)"
+
+    - name: IPHash
+      type: soft_affinity
+      description: |
+        NGINX's `ip_hash` load balancing directive uses the client's IP address to consistently
+        select the same upstream server. Available in both NGINX OSS and Plus. Configured via
+        NGF's custom `UpstreamSettingsPolicy` CRD which targets backend Services. This is soft
+        affinity — adding/removing backends can change the hash mapping.
+      enabled_by_default: false
+      configuration_method: "CRD field (`UpstreamSettingsPolicy.spec.loadBalancingMethod` = `ip_hash`)"
+
+      config_options:
+        - field: loadBalancingMethod
+          type: enum
+          required: true
+          default: "random two least_conn"
+          description: "Must be set to `ip_hash` for IP-based affinity. 16 methods available total (8 OSS, 14 Plus)."
+          support_level: full
+        - field: zoneSize
+          type: string
+          required: false
+          default: "512k (OSS), 1m (Plus)"
+          description: "Shared memory zone size for upstream configuration"
+          support_level: full
+        - field: keepAlive.connections
+          type: int32
+          required: false
+          default: "16"
+          description: "Maximum keepalive connections per upstream"
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "`UpstreamSettingsPolicy`"
+        scope: "per-service (targets 1-16 Services via `targetRefs`)"
+
+  attachment_points:
+    - mechanism: StickyCookie
+      layer: route_rule
+      native_resource: "`HTTPRoute`/`GRPCRoute` `rule.sessionPersistence`"
+      description: |
+        Session persistence is configured inline on each `HTTPRoute`/`GRPCRoute` rule via the
+        Gateway API's `sessionPersistence` field. Each rule can have its own session persistence
+        configuration with a unique cookie name. NGF reads this at the route rule level, flows
+        it through `BackendRef` to the dataplane `Upstream`, and renders it as a `sticky cookie`
+        directive in the `upstream` block.
+    - mechanism: IPHash
+      layer: backend_service
+      native_resource: "`UpstreamSettingsPolicy`"
+      description: |
+        `UpstreamSettingsPolicy` targets backend Services via `targetRefs`. The `ip_hash` load balancing
+        method is applied at the upstream (service) level. All routes targeting the same service
+        share the same load balancing method.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "implemented"
+      dataplane_target:
+        name: "sticky cookie directive"
+        label: "generates"
+    btp:
+      target_layer: backend_service
+      label: "not yet implemented"
+      dataplane_target:
+        name: "sticky cookie directive"
+        label: "would generate"
+
+  dataplane_translation:
+    description: |
+      NGF follows a straightforward controller pattern: watch Gateway API resources, build an
+      internal graph representation, translate to a dataplane intermediate representation (IR),
+      then render Go templates into `nginx.conf` files. The pipeline is:
+
+      1. Change Processor: Watches ~25+ resource types (`Gateway`, `HTTPRoute`, `GRPCRoute`, Services,
+         `UpstreamSettingsPolicy`, etc.) via controller-runtime. Captures upserts/deletes.
+
+      2. Graph Builder: `graph.BuildGraph()` creates a validated graph of all Gateway API resources,
+         resolving references, validating configs, and attaching policies. Session persistence
+         config is extracted from `HTTPRoute`/`GRPCRoute` rules via `processSessionPersistenceConfig()`
+         and stored in `BackendRef.SessionPersistence`.
+
+      3. Dataplane Builder: `dataplane.BuildConfiguration()` converts the graph into an IR
+         (`dataplane.Configuration`). `buildUpstreams()` iterates route rules, creating `Upstream`
+         objects. `SessionPersistence` flows from `graph.BackendRef.SessionPersistence` into
+         `dataplane.SessionPersistenceConfig` on each `Upstream`.
+
+      4. Config Generator: `GeneratorImpl.Generate()` renders the IR into nginx config files using
+         Go templates. `createUpstream()` converts `dataplane.Upstream` into `http.Upstream`, calling
+         `getSessionPersistenceConfiguration()` to map session persistence (Plus only). The
+         `upstreamsTemplateText` Go template renders `sticky cookie` directives.
+
+      5. NGINX Agent: Generated config files are sent to the NGINX Agent (v3) running alongside
+         NGINX, which writes them and triggers an NGINX reload.
+
+    nginx_features_used:
+      - "sticky cookie (NGINX Plus only) — cookie-based strong persistence"
+      - "ip_hash — source IP soft affinity (OSS and Plus)"
+      - "hash / hash consistent — hash-based LB with configurable key (OSS and Plus)"
+      - "upstream zone — shared memory for upstream state"
+      - "state file — NGINX Plus upstream persistence across reloads"
+    key_code_paths:
+      - "internal/controller/handler.go — orchestrates event handling, triggers config generation"
+      - "internal/controller/state/change_processor.go — watches resources, builds graph"
+      - "internal/controller/state/graph/httproute.go — parses HTTPRoute rules, extracts sessionPersistence"
+      - "internal/controller/state/graph/route_common.go — processSessionPersistenceConfig(), SessionPersistenceConfig type"
+      - "internal/controller/state/graph/backend_refs.go — BackendRef with SessionPersistence field"
+      - "internal/controller/state/dataplane/configuration.go — buildUpstreams(), buildUpstream() with session persistence"
+      - "internal/controller/state/dataplane/types.go — SessionPersistenceConfig, Upstream types"
+      - "internal/controller/nginx/config/generator.go — GeneratorImpl.Generate(), executeConfigTemplates()"
+      - "internal/controller/nginx/config/upstreams.go — createUpstream(), getSessionPersistenceConfiguration()"
+      - "internal/controller/nginx/config/upstreams_template.go — upstream template with sticky cookie directive"
+      - "internal/controller/nginx/config/http/config.go — Upstream, UpstreamSessionPersistence types"
+      - "internal/controller/nginx/config/policies/upstreamsettings/processor.go — processes UpstreamSettingsPolicy (ip_hash, etc.)"
+      - "apis/v1alpha1/upstreamsettingspolicy_types.go — UpstreamSettingsPolicy CRD with LoadBalancingMethod"
+    flow: |
+      Cookie-based (Plus):
+        HTTPRoute.rule.sessionPersistence
+          → graph/httproute.go: processHTTPRouteRule() extracts sessionPersistence
+          → graph/route_common.go: processSessionPersistenceConfig() validates, computes cookie path
+          → graph/backend_refs.go: BackendRef.SessionPersistence populated
+          → dataplane/configuration.go: buildUpstream() converts to SessionPersistenceConfig
+          → nginx/config/upstreams.go: createUpstream() → getSessionPersistenceConfiguration() (Plus only)
+          → nginx/config/upstreams_template.go: renders `sticky cookie {name} expires={expiry} path={path};`
+
+      IP hash (OSS/Plus):
+        UpstreamSettingsPolicy.spec.loadBalancingMethod = ip_hash
+          → graph/policies.go: policy attached to Service
+          → dataplane/configuration.go: policy stored on Upstream.Policies
+          → nginx/config/upstreams.go: createUpstream() → upstreamsettings.Processor.Process()
+          → upstreamsTemplateText: renders `ip_hash;` in upstream block
+
+  capabilities:
+    cookie_persistence: true    # Plus only, via sticky cookie
+    header_persistence: false   # NGINX has no header-based session persistence
+    source_ip_affinity: true    # Via ip_hash (OSS and Plus)
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true              # `sessionPersistence.sessionName` → cookie name
+      path: true              # Derived from route path matches (longest common prefix for HTTP, empty for gRPC)
+      domain: false           # Not supported — cookies are host-only scoped by design
+      ttl: true               # `absoluteTimeout` → `sticky cookie` `expires` parameter
+      secure: false           # Not supported — noted as future enhancement in design doc
+      http_only: false        # Not supported — noted as future enhancement in design doc
+      same_site: false        # Not supported — noted as future enhancement in design doc
+    idle_timeout: false       # Not supported — sessions expire only via cookie expiry or browser session end
+    absolute_timeout: true    # Maps to `sticky cookie` `expires` parameter (client-side only)
+    lifetime_type_session: true   # `cookieConfig.lifetimeType` = `Session` → no `expires` on cookie
+    lifetime_type_permanent: true  # `cookieConfig.lifetimeType` = `Permanent` → cookie has `expires` value
+
+  limitations:
+    - "Cookie-based session persistence (`sticky cookie`) requires NGINX Plus — not available in OSS"
+    - "OSS users can only use `ip_hash` for soft source-IP affinity, not true session persistence"
+    - "Header-based session persistence is not supported by NGINX in either variant"
+    - "Cookie attributes (`secure`, `httpOnly`, `sameSite`) are not configurable — design doc marks these as future work"
+    - "Cookie domain is not configurable — cookies are host-only scoped to prevent cross-host leakage"
+    - "Idle timeout is not supported — no server-side session tracking in NGINX"
+    - "For `GRPCRoute`, cookie path is always empty (omitted) since gRPC routing is method-based"
+    - "For `RegularExpression` path matches, cookie path is left empty since regex patterns are unpredictable"
+    - "Session persistence is gated behind both Plus and Experimental feature flags"
+    - "`ip_hash` provides only soft affinity — adding/removing backends changes the hash mapping"
+
+  known_issues:
+    - url: https://github.com/nginxinc/nginx-gateway-fabric/issues/4571
+      description: "Mark Routes PartiallyInvalid on duplicate session persistence names (open, blocked)"
+    - url: https://github.com/nginxinc/nginx-gateway-fabric/issues/2676
+      description: "Epic: NGINX Plus and OSS Session Persistence (completed Dec 2025)"
+    - url: https://github.com/nginxinc/nginx-gateway-fabric/pull/4471
+      description: "PR: Add Session Persistence support for NGINX OSS and Plus users (merged Dec 2025)"
+    - url: https://github.com/nginxinc/nginx-gateway-fabric/pull/4305
+      description: "PR: Add session persistence support for NGINX Plus using sticky cookie (merged Dec 2025)"
+
+gwapi_assessment:
+  overview: |
+    NGF has ALREADY implemented Gateway API session persistence as of v2.4.0 (Dec 2025). It
+    consumes the `SessionPersistence` field directly from `HTTPRoute`/`GRPCRoute` rules (route-inline)
+    and translates it to NGINX Plus's `sticky cookie` directive. For NGINX OSS, it provides
+    `ip_hash` via the `UpstreamSettingsPolicy` CRD. NGF does NOT yet support `BackendTrafficPolicy`
+    for session persistence — all cookie-based config is route-inline only.
+
+    NGF's implementation is notable because it directly consumes the Gateway API spec fields
+    (`sessionName`, `type`, `absoluteTimeout`, `cookieConfig.lifetimeType`) without an intermediate
+    native CRD layer. The translation from Gateway API → NGINX config is straightforward.
+    It uses Gateway API v1.5.1.
+
+  route_inline:
+    difficulty: trivial
+    description: |
+      Already implemented. NGF reads `sessionPersistence` from `HTTPRoute`/`GRPCRoute` rules and
+      translates to NGINX Plus `sticky cookie` directives. The implementation handles cookie name
+      generation, expiry from `absoluteTimeout`, path derivation from route matches, and lifetime
+      type (session vs permanent). Validation ensures Plus and Experimental feature flags are
+      enabled. Cookie names are auto-generated with `sp_` prefix if not specified.
+    mapping_strategy: |
+      Direct mapping: `HTTPRoute.rule.sessionPersistence` → `processSessionPersistenceConfig()`
+        → `SessionPersistenceConfig` (graph IR) → `dataplane.SessionPersistenceConfig`
+        → `http.UpstreamSessionPersistence` → nginx `sticky cookie` directive in `upstream` block.
+      The cookie path is computed as the longest common prefix of route path matches (HTTP)
+      or omitted (gRPC/regex).
+    gotchas:
+      - "Only supported with NGINX Plus — OSS users get a validation error"
+      - "Gated behind Experimental feature flag in addition to Plus flag"
+      - "Cookie path computation uses longest common prefix for multiple path matches"
+      - "gRPC and regex path matches produce empty cookie paths"
+      - "Duplicate session names across route rules produces a warning (issue #4571)"
+    code_changes_needed:
+      - "None — already implemented in v2.4.0"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      NGF does NOT currently support `BackendTrafficPolicy` for session persistence. Session
+      persistence is only available via route-inline configuration. However, NGF already has
+      a custom `UpstreamSettingsPolicy` CRD that attaches to Services (which is the same
+      attachment model as `BackendTrafficPolicy`). Adding BTP support would require:
+      (1) Watching for `BackendTrafficPolicy` resources
+      (2) Extracting `sessionPersistence` config from BTP
+      (3) Merging BTP session persistence with route-inline (with proper precedence)
+      (4) Flowing the config to the upstream builder
+
+      The `UpstreamSettingsPolicy` already demonstrates the pattern — it attaches to Services
+      via `targetRefs` and flows config through policies to the upstream builder. BTP session
+      persistence would follow a similar path, but needs to integrate with the existing
+      route-inline session persistence flow and establish precedence rules.
+    mapping_strategy: |
+      `BackendTrafficPolicy.sessionPersistence` → attach to Service (like `UpstreamSettingsPolicy`)
+        → flow through policies on `graph.ReferencedService`
+        → merge with route-inline session persistence in `buildUpstream()`
+        → render `sticky cookie` directive in `upstream` template.
+    gotchas:
+      - "Must define precedence between route-inline and BTP session persistence"
+      - "Current session persistence flows from route rule → `BackendRef` → `Upstream`, not from Service → `Upstream`"
+      - "Would need to reconcile two config sources for the same upstream"
+      - "`UpstreamSettingsPolicy` already provides `ip_hash` at the service level — how does this interact with BTP?"
+    code_changes_needed:
+      - "Add `BackendTrafficPolicy` to the change processor's watched resource types"
+      - "Add BTP session persistence extraction in the graph builder"
+      - "Merge BTP and route-inline session persistence configs in `dataplane/configuration.go`"
+      - "Define precedence: route-inline overrides BTP (per GEP-1619 spec)"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "`sticky cookie` (NGINX Plus directive)"
+      mapping_difficulty: direct
+      notes: "Direct mapping. Only `Cookie` type is supported."
+    - gwapi_field: "type: Header"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "NGINX has no header-based session persistence directive."
+    - gwapi_field: "sessionName"
+      native_field: "`sticky cookie {name}`"
+      mapping_difficulty: direct
+      notes: "Maps directly to the cookie name in the `sticky cookie` directive. Auto-generated with `sp_` prefix if not provided."
+    - gwapi_field: "absoluteTimeout"
+      native_field: "`sticky cookie ... expires={duration}`"
+      mapping_difficulty: direct
+      notes: "Maps to the `expires` parameter of the `sticky cookie` directive. Client-side expiry only."
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "NGINX has no server-side session tracking. Not implementable without dataplane changes."
+    - gwapi_field: "cookieConfig.lifetimeType: Session"
+      native_field: "`sticky cookie ...` (no `expires`)"
+      mapping_difficulty: direct
+      notes: "`Session` lifetime = omit `expires` parameter → browser session cookie."
+    - gwapi_field: "cookieConfig.lifetimeType: Permanent"
+      native_field: "`sticky cookie ... expires={absoluteTimeout}`"
+      mapping_difficulty: direct
+      notes: "`Permanent` lifetime = include `expires` parameter from `absoluteTimeout`."
+    - gwapi_field: "cookie path (computed)"
+      native_field: "`sticky cookie ... path={path}`"
+      mapping_difficulty: direct
+      notes: "Computed as longest common prefix of route path matches. Maps to `sticky cookie` `path` parameter."
+
+  deviations:
+    - "NGF only supports cookie-based persistence, not header-based (NGINX limitation)"
+    - "Session persistence requires NGINX Plus — OSS can only use `ip_hash` for soft affinity via a separate CRD"
+    - "No `BackendTrafficPolicy` support yet — session persistence is route-inline only"
+    - "Cookie attributes (`secure`, `httpOnly`, `sameSite`) are not yet configurable"
+    - "No idle timeout support — NGINX has no server-side session state tracking"
+    - "The `ip_hash` mechanism (OSS) is exposed via a custom `UpstreamSettingsPolicy` CRD, not Gateway API `SessionPersistence`"
+    - "Session persistence is behind Experimental feature flag even though it's using standard Gateway API fields"
+
+  overall_difficulty: trivial
+  summary: |
+    NGF has already implemented GEP-1619 route-inline session persistence for NGINX Plus users
+    as of v2.4.0 (Dec 2025). The implementation directly consumes Gateway API `SessionPersistence`
+    fields (`sessionName`, `type`, `absoluteTimeout`, `cookieConfig.lifetimeType`) and translates them
+    to NGINX Plus `sticky cookie` directives. The architecture is clean: Gateway API resources
+    → graph IR → dataplane IR → Go templates → `nginx.conf`.
+
+    Key strengths:
+    - Direct consumption of Gateway API `SessionPersistence` spec (no intermediate CRD needed)
+    - Cookie path computation from route matches (longest common prefix)
+    - Auto-generation of cookie names with `sp_` prefix
+    - Clean separation between route-inline (cookie) and policy-based (`ip_hash`) mechanisms
+
+    Key gaps:
+    - No `BackendTrafficPolicy` support (moderate effort to add given existing `UpstreamSettingsPolicy` pattern)
+    - NGINX Plus required for cookie persistence (OSS limited to `ip_hash`)
+    - No header-based persistence (NGINX dataplane limitation)
+    - No idle timeout (NGINX dataplane limitation)
+    - Cookie attributes (`secure`, `httpOnly`, `sameSite`) not yet configurable
+
+    For GEP-1619 analysis, NGF is significant because it demonstrates a direct, working
+    implementation of route-inline session persistence using the Gateway API spec. The dual
+    OSS/Plus model also illustrates how dataplanes with different capabilities handle the
+    same API fields differently.

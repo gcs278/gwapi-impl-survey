@@ -1,0 +1,112 @@
+# Schema definition for implementation analysis YAML files
+# Every implementation report should follow this structure
+
+schema:
+  metadata:
+    name: string           # Implementation name
+    type: enum             # "implementation" | "dataplane" | "both"
+    dataplane: string      # Underlying dataplane (e.g. "Envoy", "Nginx", "HAProxy", "native")
+    version_analyzed: string
+    repo_url: string
+    docs_url: string
+    last_updated: date
+
+  # API stack: describes the layers of API abstraction from user to dataplane.
+  # Used to render the "API Stack" visual at the top of the implementation page.
+  api_stack:
+    translation_model: enum  # "intermediate" | "direct"
+      # intermediate: Gateway API → implementation-specific API → dataplane config
+      #     e.g. Istio: Gateway API → DestinationRule → Envoy xDS
+      # direct: Gateway API → dataplane config (no intermediate API)
+      #     e.g. NGF: Gateway API → nginx.conf
+    layers:                  # Ordered top-to-bottom: user-facing → dataplane
+      - name: string         # e.g. "Gateway API", "Istio API", "Envoy xDS"
+        type: enum           # "gwapi" | "intermediate" | "dataplane"
+        resources: list      # Key resources at this layer for session persistence
+        description: string  # Brief note about what happens at this layer
+
+  native_profile:
+    overview: string       # Brief description of how this impl handles session persistence
+
+    mechanisms:            # List of session persistence mechanisms
+      - name: string       # e.g. "ConsistentHashLB", "StatefulSession"
+        type: enum         # "soft_affinity" | "strong_persistence"
+        description: string
+        enabled_by_default: bool
+        configuration_method: string  # e.g. "CRD field", "env var + label", "annotation"
+
+        config_options:    # What can users configure?
+          - field: string
+            type: string
+            required: bool
+            default: string
+            description: string
+            support_level: enum  # "full" | "partial" | "none"
+
+        attachment_model:
+          attaches_to: string      # e.g. "Service", "Route", "Upstream", "Global"
+          resource_type: string    # e.g. "DestinationRule", "Ingress annotation"
+          scope: string            # e.g. "per-service", "per-route", "global"
+
+    dataplane_translation:
+      description: string
+      envoy_features_used: list    # e.g. ["RouteAction_HashPolicy", "stateful_session filter"]
+      key_code_paths: list         # file paths in the repo
+      flow: string                 # text description of config flow
+
+    capabilities:
+      cookie_persistence: bool
+      header_persistence: bool
+      source_ip_affinity: bool
+      url_encoded_sessions: bool
+      cookie_attributes:
+        name: bool
+        path: bool
+        domain: bool
+        ttl: bool
+        secure: bool
+        http_only: bool
+        same_site: bool
+      idle_timeout: bool
+      absolute_timeout: bool
+      lifetime_type_session: bool
+      lifetime_type_permanent: bool
+
+    # Standardized attachment model — maps each mechanism to canonical layers:
+    #   client → gateway → route_rule → backend_service → endpoint
+    # Use consistent layer names across all implementations for comparison.
+    attachment_points:
+      - mechanism: string          # Name of the mechanism (must match mechanisms[].name)
+        layer: enum                # "gateway" | "route_rule" | "backend_service" | "endpoint" | "global"
+        native_resource: string    # e.g. "DestinationRule", "Ingress annotation"
+        description: string        # How it attaches at this layer
+
+    limitations: list              # Known limitations or quirks
+    known_issues: list             # GitHub issues, bugs
+
+  gwapi_assessment:
+    overview: string
+
+    route_inline:
+      difficulty: enum             # "trivial" | "moderate" | "significant" | "requires_dataplane_changes"
+      description: string
+      mapping_strategy: string     # How route-inline maps to native concepts
+      gotchas: list
+      code_changes_needed: list
+
+    backend_traffic_policy:
+      difficulty: enum
+      description: string
+      mapping_strategy: string
+      gotchas: list
+      code_changes_needed: list
+
+    field_mapping:                 # How each GEP-1619 field maps
+      - gwapi_field: string
+        native_field: string
+        mapping_difficulty: enum   # "direct" | "translation_needed" | "not_supported" | "no_native_equivalent"
+        notes: string
+
+    deviations: list               # Where the impl's model differs from GEP-1619 assumptions
+    overall_difficulty: enum       # "trivial" | "moderate" | "significant" | "requires_dataplane_changes"
+    summary: string

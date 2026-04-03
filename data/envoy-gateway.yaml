@@ -1,0 +1,292 @@
+metadata:
+  name: Envoy Gateway
+  type: controller
+  dataplane: Envoy
+  version_analyzed: "master branch, April 2026"
+  repo_url: https://github.com/envoyproxy/gateway
+  docs_url: https://gateway.envoyproxy.io/docs/
+  last_updated: 2026-04-02
+
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute.rule.sessionPersistence"
+      description: "User-facing API. Envoy Gateway reads sessionPersistence directly from HTTPRoute rules — no intermediate API."
+    - name: Envoy xDS
+      type: dataplane
+      resources:
+        - "envoy.filters.http.stateful_session (cookie or header)"
+        - "StatefulSessionPerRoute (typed_per_filter_config)"
+      description: "Envoy's configuration delivered via xDS. The stateful_session filter is used for strong persistence."
+
+native_profile:
+  overview: |
+    Envoy Gateway is a pure Gateway API implementation — it has no native/proprietary session
+    persistence API. All session persistence configuration comes exclusively from Gateway API's
+    `HTTPRoute.rule.sessionPersistence` field. EG translates this directly into Envoy's
+    `stateful_session` HTTP filter, which provides strong session persistence by encoding the actual
+    backend address into a cookie or header. Unlike Istio, EG does NOT use `ConsistentHashLB`
+    (hash-based affinity) for session persistence — only the `stateful_session` filter.
+
+    Notably, Envoy Gateway's own `BackendTrafficPolicy` CRD does NOT include a `sessionPersistence`
+    field. Session persistence is exclusively route-inline via Gateway API.
+
+  mechanisms:
+    - name: Stateful Session Filter
+      type: strong_persistence
+      description: |
+        Uses Envoy's `envoy.filters.http.stateful_session` filter to encode the actual backend
+        address (IP:Port, base64) into a cookie or header. On subsequent requests, the filter
+        bypasses the load balancer entirely to route to the exact same backend. The filter is
+        added at the HCM (listener) level in a disabled state, then overridden per-route via
+        `TypedPerFilterConfig` to enable it with route-specific settings.
+      enabled_by_default: false
+      configuration_method: "Gateway API field (`HTTPRoute.rule.sessionPersistence`)"
+
+      config_options:
+        - field: sessionPersistence.type
+          type: "enum (Cookie, Header)"
+          required: false
+          default: Cookie
+          description: "Session persistence type — Cookie (default) or Header."
+          support_level: full
+        - field: sessionPersistence.sessionName
+          type: string
+          required: false
+          default: "auto-generated from route name"
+          description: "Name for the cookie or header. If not specified, EG auto-generates a unique name per route using the route destination name with `/` replaced by `-`."
+          support_level: full
+        - field: sessionPersistence.absoluteTimeout
+          type: duration
+          required: false
+          default: null
+          description: "Maps to cookie TTL when `lifetimeType` is `Permanent`. Ignored for session cookies."
+          support_level: partial
+        - field: sessionPersistence.idleTimeout
+          type: duration
+          required: false
+          default: null
+          description: "NOT SUPPORTED — returns an error if specified."
+          support_level: none
+        - field: cookieConfig.lifetimeType
+          type: "enum (Session, Permanent)"
+          required: false
+          default: Session
+          description: "`Session` = session cookie (no TTL). `Permanent` = persistent cookie (requires `absoluteTimeout` for TTL)."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Route Rule
+        resource_type: "HTTPRoute.rule.sessionPersistence"
+        scope: "per-route-rule (applied to each match within a rule)"
+
+  attachment_points:
+    - mechanism: Stateful Session Filter
+      layer: route_rule
+      native_resource: "HTTPRoute.rule.sessionPersistence"
+      description: |
+        Session persistence is configured inline on `HTTPRoute` rules. The controller reads
+        the `sessionPersistence` field from each route rule, translates it to Envoy's
+        `stateful_session` filter config, and applies it per-route via `TypedPerFilterConfig`.
+        There is no service-level or gateway-level attachment — only route-inline.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "implemented"
+      dataplane_target:
+        name: "stateful_session filter"
+        label: "generates"
+    btp:
+      target_layer: backend_service
+      label: "not yet implemented"
+      dataplane_target:
+        name: "stateful_session filter"
+        label: "would generate"
+
+  dataplane_translation:
+    description: |
+      Envoy Gateway reads `HTTPRoute.rule.sessionPersistence` and translates it directly to
+      Envoy xDS configuration with no intermediate API layer. The translation pipeline:
+
+      1. `route.go` reads `rule.SessionPersistence` from the Gateway API `HTTPRoute`
+      2. Creates an IR `SessionPersistence` with `Cookie` (name, TTL) or `Header` (name)
+      3. `session_persistence.go` `patchHCM()` adds the `stateful_session` filter to the HCM
+         in a DISABLED state (using the first route with session persistence as a template)
+      4. `session_persistence.go` `patchRoute()` adds per-route `TypedPerFilterConfig` to override
+         and enable the filter with route-specific cookie/header settings
+      5. Cookie path is computed from the route's path match via `routePathToCookiePath()`:
+         - Exact match → use exact path
+         - Prefix match → use prefix
+         - Regex match → longest non-regex prefix (e.g. `/p1/p2/*/p3` → `/p1/p2`)
+         - No path → `"/"`
+    envoy_features_used:
+      - "envoy.filters.http.stateful_session (HCM-level, disabled by default)"
+      - "StatefulSessionPerRoute (per-route override via typed_per_filter_config)"
+      - "CookieBasedSessionState (envoy.http.stateful_session.cookie)"
+      - "HeaderBasedSessionState (envoy.http.stateful_session.header)"
+    key_code_paths:
+      - "internal/gatewayapi/route.go — reads rule.SessionPersistence, creates IR config"
+      - "internal/ir/xds.go — SessionPersistence, CookieBasedSessionPersistence, HeaderBasedSessionPersistence"
+      - "internal/xds/translator/session_persistence.go — patchHCM(), patchRoute(), buildStatefulSessionFilterConfig()"
+      - "internal/xds/translator/session_persistence.go — routePathToCookiePath(), getLongestNonRegexPrefix()"
+    flow: |
+      HTTPRoute.rule.sessionPersistence
+        → route.go: buildRouteRuleIR()
+          → IR SessionPersistence { Cookie{Name,TTL} | Header{Name} }
+        → session_persistence.go: patchHCM()
+          → Envoy HCM http_filters[stateful_session] (disabled)
+        → session_persistence.go: patchRoute()
+          → Envoy Route typed_per_filter_config[stateful_session]
+            → CookieBasedSessionState{name, path, ttl}
+            OR HeaderBasedSessionState{name}
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: true
+    source_ip_affinity: false
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true
+      path: true       # Computed from route path match
+      domain: false
+      ttl: true         # Via absoluteTimeout + Permanent lifetimeType
+      secure: false
+      http_only: false
+      same_site: false
+    idle_timeout: false
+    absolute_timeout: true   # Maps to cookie TTL for permanent cookies
+    lifetime_type_session: true   # Default — session cookie (no TTL)
+    lifetime_type_permanent: true  # Requires absoluteTimeout for TTL
+
+  limitations:
+    - "No source IP affinity — only cookie and header persistence via `stateful_session` filter"
+    - "No `idleTimeout` — explicitly rejected with error if specified"
+    - "Cookie path is computed from route path match, not user-configurable"
+    - "Cookie `domain` is not configurable"
+    - "No cookie attributes (`Secure`, `HttpOnly`, `SameSite`) beyond name, path, and TTL"
+    - "Stateful session encodes backend address in cookie — security concern (clients can target specific backends)"
+    - "No session persistence on EG's own `BackendTrafficPolicy` — route-inline only"
+    - "No `ConsistentHashLB`-based soft affinity option for session persistence"
+
+  known_issues: []
+
+gwapi_assessment:
+  overview: |
+    Envoy Gateway is a Gateway API-native implementation — it reads `sessionPersistence` directly
+    from `HTTPRoute` rules with no intermediate API. This makes it one of the simplest cases for
+    GEP-1619 route-inline support, which is ALREADY IMPLEMENTED. However, EG's own
+    `BackendTrafficPolicy` does NOT include `sessionPersistence`, so the BTP attachment point from
+    GEP-1619 would require adding a new field to EG's `BackendTrafficPolicy` CRD.
+
+    EG uses only Envoy's `stateful_session` filter (strong persistence), not `ConsistentHashLB`.
+    This aligns well with GEP-1619's definition of session persistence as "strong."
+
+  route_inline:
+    difficulty: trivial
+    description: |
+      Route-inline session persistence is ALREADY IMPLEMENTED. Envoy Gateway reads
+      `HTTPRoute.rule.sessionPersistence` directly and translates it to Envoy's `stateful_session`
+      filter. `Cookie` and `Header` types are both supported. Session name is auto-generated if
+      not specified. Cookie path is computed from route path matches. `absoluteTimeout` maps to
+      cookie TTL for permanent cookies. `idleTimeout` is explicitly rejected.
+    mapping_strategy: |
+      Direct translation: `HTTPRoute.rule.sessionPersistence` → IR `SessionPersistence`
+      → Envoy `stateful_session` filter (disabled at HCM, enabled per-route via `TypedPerFilterConfig`).
+      No intermediate API to translate through.
+    gotchas:
+      - "`idleTimeout` is explicitly rejected — returns error if specified"
+      - "`sessionName` auto-generation uses route destination name (not the GEP-1619 session name semantics)"
+      - "Cookie path is auto-computed from route path match — no user override"
+      - "`absoluteTimeout` only applies when `lifetimeType` is `Permanent`; otherwise ignored"
+      - "Session name uniqueness validation is NOT implemented — relies on Gateway API-level validation"
+    code_changes_needed:
+      - "None for basic support — already implemented"
+      - "May need updates as GEP-1619 fields evolve (e.g., new cookie attributes, session name semantics)"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      Envoy Gateway's `BackendTrafficPolicy` CRD does NOT have a `sessionPersistence` field. `BTP`
+      targets `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute` — but NOT `Services`
+      directly. Adding session persistence to BTP would require:
+      (1) Adding a `sessionPersistence` field to `BackendTrafficPolicySpec` or its `ClusterSettings`
+      (2) Translating BTP session persistence to the same Envoy `stateful_session` filter config
+      (3) Handling precedence between BTP-level and route-inline session persistence
+
+      The translation itself would be straightforward since EG already has the `stateful_session`
+      translation code. The main work is API design and precedence logic.
+    mapping_strategy: |
+      Add `sessionPersistence` to `BackendTrafficPolicySpec` → reuse existing IR `SessionPersistence`
+      and `stateful_session` translation code → apply as default for routes targeting the BTP's
+      target, overridden by route-inline `sessionPersistence` where present.
+    gotchas:
+      - "EG's BTP targets routes/gateways, not `Services` — different from GEP-1619's BTP-to-Service model"
+      - "Precedence between BTP and route-inline needs to be defined (route-inline should win per GEP-1619)"
+      - "BTP inline into `ClusterSettings` or as a top-level field? API design decision needed"
+      - "Cookie path computation differs — BTP has no route path match, so path would default to `'/'`"
+      - "`sessionName` uniqueness across BTP and route-inline would need cross-resource validation"
+    code_changes_needed:
+      - "`api/v1alpha1/backendtrafficpolicy_types.go` — add `SessionPersistence` field"
+      - "`internal/gatewayapi/` — translate BTP `sessionPersistence` to IR"
+      - "Handle BTP vs route-inline precedence (route-inline wins)"
+      - "Add validation for `sessionPersistence` in BTP context"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "IR SessionPersistence.Cookie (→ CookieBasedSessionState)"
+      mapping_difficulty: direct
+      notes: "Default type. Direct mapping to Envoy's cookie-based `stateful_session`."
+    - gwapi_field: "type: Header"
+      native_field: "IR SessionPersistence.Header (→ HeaderBasedSessionState)"
+      mapping_difficulty: direct
+      notes: "Direct mapping to Envoy's header-based `stateful_session`."
+    - gwapi_field: "sessionName"
+      native_field: "Cookie.Name or Header.Name in IR"
+      mapping_difficulty: direct
+      notes: "Maps directly. Auto-generated from route destination name if not specified."
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: "Cookie with no TTL"
+      mapping_difficulty: direct
+      notes: "Default behavior — session cookie with no expiry."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: "Cookie with TTL from absoluteTimeout"
+      mapping_difficulty: direct
+      notes: "TTL set from `absoluteTimeout` duration."
+    - gwapi_field: "absoluteTimeout"
+      native_field: "Cookie.TTL (only when lifetimeType=Permanent)"
+      mapping_difficulty: direct
+      notes: "Only applied for permanent cookies. Ignored for session cookies."
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "Explicitly rejected with error. No Envoy equivalent without server-side tracking."
+    - gwapi_field: "cookie path (computed)"
+      native_field: "routePathToCookiePath() → exact/prefix/longest-non-regex-prefix"
+      mapping_difficulty: direct
+      notes: "EG already implements the GEP-1619 cookie path computation algorithm via `routePathToCookiePath()`."
+
+  deviations:
+    - "EG's `BackendTrafficPolicy` does not have `sessionPersistence` — only route-inline is supported today"
+    - "EG's `BackendTrafficPolicy` targets routes/gateways, not `Services` — different attachment model from GEP-1619 BTP"
+    - "`idleTimeout` is explicitly rejected — no workaround or degraded mode"
+    - "`sessionName` auto-generation uses internal route naming, not GEP-1619's session name semantics"
+    - "No `sessionName` uniqueness validation — deferred to Gateway API-level validation"
+    - "Cookie path is always auto-computed from route matches — cannot be overridden by users"
+
+  overall_difficulty: trivial
+  summary: |
+    Envoy Gateway is one of the easiest implementations for GEP-1619 because:
+    (1) Route-inline session persistence is ALREADY IMPLEMENTED and working.
+    (2) EG uses Envoy's `stateful_session` filter (strong persistence), aligning with GEP-1619's
+        definition of session persistence as "strong."
+    (3) Direct translation model — no intermediate API to map through or bypass.
+    (4) The cookie path computation already follows the GEP-1619 algorithm.
+
+    The main gap is `BackendTrafficPolicy` support, which would require adding a new field to
+    EG's `BackendTrafficPolicy` CRD and handling precedence with route-inline. This is moderate effort but
+    straightforward since the translation code already exists. Overall, EG demonstrates the
+    "happy path" for a direct-translation Gateway API implementation.

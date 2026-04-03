@@ -1,0 +1,471 @@
+metadata:
+  name: Traefik
+  type: integrated
+  dataplane: Traefik (built-in)
+  version_analyzed: "master branch (v3.x), April 2026"
+  repo_url: https://github.com/traefik/traefik
+  docs_url: https://doc.traefik.io/traefik/
+  last_updated: 2026-04-03
+
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute.rule.sessionPersistence (NOT YET MERGED — PR #12537)"
+        - "XBackendTrafficPolicy.sessionPersistence (NOT YET MERGED — PR #12537)"
+      description: |
+        User-facing API. PR #12537 adds support for reading sessionPersistence from HTTPRoute rules
+        and XBackendTrafficPolicy resources, translating them directly to Traefik's internal
+        dynamic.Sticky config. NOT YET MERGED as of April 2026.
+    - name: Traefik Native API (IngressRoute / TraefikService CRDs)
+      type: intermediate
+      resources:
+        - "IngressRoute.spec.routes[].services[].sticky.cookie"
+        - "TraefikService.spec.weighted.sticky.cookie"
+        - "TraefikService.spec.weighted.services[].sticky.cookie"
+        - "dynamic.Sticky { Cookie | Header }"
+      description: |
+        Traefik's proprietary CRDs (IngressRoute, TraefikService) and dynamic config model.
+        Sticky sessions are configured via `sticky.cookie` (and with PR #12537, `sticky.header`)
+        on service load balancer configs. This is the native API that currently supports session
+        persistence. Gateway API support bypasses this layer — it translates directly to the
+        dynamic config model (dynamic.Sticky).
+    - name: Traefik Built-in Proxy
+      type: dataplane
+      resources:
+        - "pkg/server/service/loadbalancer/wrr/wrr.go (WRR with sticky support)"
+        - "pkg/server/service/loadbalancer/sticky.go (Sticky handler — cookie & header)"
+      description: |
+        Traefik is an integrated proxy — it IS the dataplane. No external proxy (Envoy/Nginx)
+        is involved. The Go-based WRR load balancer directly checks for sticky cookies/headers
+        in ServeHTTP(), routes to the pinned backend, and writes Set-Cookie/response headers.
+
+native_profile:
+  overview: |
+    Traefik is a self-contained Go reverse proxy that serves as both control plane and data plane.
+    Unlike implementations that use Envoy or Nginx as a separate dataplane, Traefik's sticky session
+    logic is built directly into its Go load balancer code (pkg/server/service/loadbalancer/).
+
+    Natively, Traefik supports cookie-based sticky sessions via `sticky.cookie` on its load balancer
+    config. With PR #12537 (open, not yet merged), header-based sticky sessions are also being added
+    via `sticky.header`. Source IP affinity is available through the HRW (Highest Random Weight /
+    Rendezvous Hashing) load balancing strategy, which consistently hashes client IPs to backends.
+
+    For Kubernetes, session persistence is configured via:
+    1. IngressRoute CRD: `spec.routes[].services[].sticky.cookie`
+    2. TraefikService CRD: `spec.weighted.sticky.cookie` (WRR level) and
+       `spec.weighted.services[].sticky.cookie` (per-service level)
+    3. Ingress annotations: `traefik.ingress.kubernetes.io/service.sticky.cookie*`
+    4. Gateway API: NOT YET SUPPORTED in mainline. PR #12537 adds `sessionPersistence` on HTTPRoute
+       and `XBackendTrafficPolicy` support.
+
+    The cookie value is a hash (SHA-256, truncated to 16 chars) of the backend server name/address.
+    This means Traefik encodes backend identity in the cookie, similar to Envoy's stateful_session
+    filter. If the pinned backend goes down, failover to a new backend occurs automatically and
+    the cookie is updated.
+
+  mechanisms:
+    - name: Sticky Cookie
+      type: strong_persistence
+      description: |
+        Cookie-based session persistence. On the first request, Traefik's WRR load balancer selects
+        a backend and writes a Set-Cookie header with a hashed value identifying the backend. On
+        subsequent requests, the cookie is read and the request is routed directly to the same
+        backend, bypassing normal load balancing. If the backend is unhealthy, failover occurs
+        and the cookie is rewritten.
+
+        The cookie value is a SHA-256 hash (truncated to 16 chars) of the backend server name.
+        Default cookie name is an abbreviation of a SHA-1 hash (e.g., `_1d52e`).
+      enabled_by_default: false
+      configuration_method: "CRD field (IngressRoute/TraefikService), dynamic config, or annotations"
+
+      config_options:
+        - field: sticky.cookie.name
+          type: string
+          required: false
+          default: "SHA-1 abbreviation (e.g., _1d52e)"
+          description: "Name of the sticky cookie."
+          support_level: full
+        - field: sticky.cookie.secure
+          type: bool
+          required: false
+          default: false
+          description: "Whether the cookie requires HTTPS."
+          support_level: full
+        - field: sticky.cookie.httpOnly
+          type: bool
+          required: false
+          default: false
+          description: "Whether the cookie is inaccessible to JavaScript."
+          support_level: full
+        - field: sticky.cookie.sameSite
+          type: "enum (none, lax, strict)"
+          required: false
+          default: ""
+          description: "SameSite cookie attribute."
+          support_level: full
+        - field: sticky.cookie.maxAge
+          type: int
+          required: false
+          default: "0 (never expires)"
+          description: "Cookie TTL in seconds. 0 = session cookie. Negative = immediate expiry."
+          support_level: full
+        - field: sticky.cookie.path
+          type: string
+          required: false
+          default: "/"
+          description: "Cookie path attribute. Defaults to '/'."
+          support_level: full
+        - field: sticky.cookie.domain
+          type: string
+          required: false
+          default: ""
+          description: "Cookie domain attribute. Added via PR #11556. Enables cross-subdomain sessions."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "IngressRoute service ref, TraefikService spec, or dynamic config"
+        scope: "per-service (load balancer level)"
+
+    - name: Sticky Header
+      type: strong_persistence
+      description: |
+        Header-based session persistence (being added in PR #12537, not yet in mainline).
+        Works like sticky cookies but uses a custom response header instead. On the first request,
+        the load balancer selects a backend and sets a response header with the hashed backend name.
+        The client must read this header and include it in subsequent requests. Useful for API
+        clients, gRPC, and scenarios where cookies are impractical.
+
+        Default header name is `X-Sticky-Session`. The header value is the same SHA-256 hash
+        of the backend server name used for cookies.
+      enabled_by_default: false
+      configuration_method: "CRD field or dynamic config (PR #12537)"
+
+      config_options:
+        - field: sticky.header.name
+          type: string
+          required: false
+          default: "X-Sticky-Session"
+          description: "Name of the sticky header."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "TraefikService spec or dynamic config"
+        scope: "per-service (load balancer level)"
+
+    - name: HRW (Highest Random Weight / Rendezvous Hashing)
+      type: soft_affinity
+      description: |
+        Consistent hashing based on client source IP. Computes a score for each backend using
+        a hash of the client's source IP combined with the backend identifier, and routes to the
+        backend with the highest score. Provides source IP affinity without cookies or headers,
+        but is "soft" — adding/removing backends can reassign clients.
+      enabled_by_default: false
+      configuration_method: "Load balancer strategy setting"
+
+      config_options:
+        - field: loadBalancer.strategy
+          type: "enum (wrr, p2c, hrw, leasttime)"
+          required: false
+          default: "wrr"
+          description: "Set to 'hrw' for consistent hashing / source IP affinity."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "Dynamic config (loadBalancer.strategy)"
+        scope: "per-service"
+
+  attachment_points:
+    - mechanism: Sticky Cookie
+      layer: backend_service
+      native_resource: "IngressRoute.spec.routes[].services[].sticky.cookie, TraefikService.spec.weighted.sticky.cookie"
+      description: |
+        Sticky cookies are configured at the service/load-balancer level in Traefik's native API.
+        In IngressRoute, each service reference within a route can have its own sticky config.
+        In TraefikService, sticky can be set at the WRR level and/or per-child-service level
+        for multi-level stickiness.
+
+    - mechanism: Sticky Header
+      layer: backend_service
+      native_resource: "TraefikService.spec.weighted.sticky.header (PR #12537)"
+      description: |
+        Header-based stickiness attaches at the same service/load-balancer level as cookie
+        stickiness. Added in PR #12537, not yet merged.
+
+    - mechanism: HRW
+      layer: backend_service
+      native_resource: "loadBalancer.strategy = hrw"
+      description: |
+        Source IP affinity via HRW is a load balancer strategy setting, applied per-service.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "PR open (not merged)"
+      dataplane_target:
+        name: "dynamic.Sticky (Cookie or Header)"
+        label: "generates"
+    btp:
+      target_layer: backend_service
+      label: "PR open (not merged)"
+      dataplane_target:
+        name: "dynamic.Sticky (Cookie or Header)"
+        label: "generates"
+
+  dataplane_translation:
+    description: |
+      Traefik IS the dataplane — there is no external proxy to configure. The Gateway API provider
+      (pkg/provider/kubernetes/gateway/) reads HTTPRoute resources and translates them directly into
+      Traefik's internal dynamic configuration model (pkg/config/dynamic/). The dynamic config is
+      then consumed by Traefik's built-in Go HTTP server and load balancer.
+
+      For session persistence (PR #12537), the translation is:
+
+      1. `httproute.go: loadWRRService()` calls `convertSessionPersistence(routeRule.SessionPersistence)`
+         to convert Gateway API `SessionPersistence` to `dynamic.Sticky`
+      2. The `dynamic.Sticky` is passed down through `loadService()` → `loadHTTPServers()`
+      3. `resolveSessionPersistence()` merges route-inline and XBackendTrafficPolicy sticky configs
+         (route-inline takes precedence)
+      4. `applyStickyToServersLoadBalancer()` sets `lb.Sticky` on the `ServersLoadBalancer`
+      5. At runtime, `wrr.New()` creates `loadbalancer.NewSticky(sticky)` from the dynamic config
+      6. `wrr.ServeHTTP()` calls `sticky.StickyHandler(req)` to look up pinned backend,
+         then `sticky.WriteStickyResponse(rw, name)` to write cookie/header
+
+      For XBackendTrafficPolicy:
+      1. `loadBackendTrafficPolicySticky()` lists policies targeting the backend Service
+      2. Selects the oldest policy (by creation timestamp, then name)
+      3. Converts its `sessionPersistence` to `dynamic.Sticky`
+      4. Route-inline sessionPersistence overrides policy-level if both are present
+
+    key_code_paths:
+      - "pkg/provider/kubernetes/gateway/httproute.go — loadWRRService(), loadService(), loadHTTPServers(), convertSessionPersistence(), resolveSessionPersistence() (PR #12537)"
+      - "pkg/provider/kubernetes/gateway/client.go — ListXBackendTrafficPoliciesForService(), UpdateXBackendTrafficPolicyStatus() (PR #12537)"
+      - "pkg/config/dynamic/http_config.go — Sticky{Cookie,Header}, Cookie{Name,Secure,HTTPOnly,SameSite,MaxAge,Path,Domain}, Header{Name}"
+      - "pkg/server/service/loadbalancer/sticky.go — NewSticky(), NewStickyCookie(), NewStickyHeader(), StickyHandler(), WriteStickyResponse()"
+      - "pkg/server/service/loadbalancer/wrr/wrr.go — New(), ServeHTTP() (sticky integration)"
+      - "pkg/provider/kubernetes/crd/kubernetes_http.go — IngressRoute/TraefikService sticky translation"
+    flow: |
+      Gateway API flow (PR #12537):
+        HTTPRoute.rule.sessionPersistence
+          → httproute.go: convertSessionPersistence()
+            → dynamic.Sticky { Cookie{Name,MaxAge} | Header{Name} }
+          → httproute.go: resolveSessionPersistence()
+            (merges with XBackendTrafficPolicy, route-inline wins)
+          → httproute.go: applyStickyToServersLoadBalancer()
+            → dynamic.ServersLoadBalancer.Sticky = dynamic.Sticky
+          → wrr.New(sticky)
+            → loadbalancer.NewSticky(sticky)
+              → Sticky { mode=Cookie, cookie=stickyCookie{...} }
+              OR Sticky { mode=Header, header=stickyHeader{...} }
+          → wrr.ServeHTTP()
+            → sticky.StickyHandler(req)  // lookup pinned backend
+            → sticky.WriteStickyResponse(rw, name) // write cookie/header
+
+      Native API flow (IngressRoute/TraefikService):
+        IngressRoute.spec.routes[].services[].sticky.cookie
+          → kubernetes_http.go: buildServicesLB()
+            → dynamic.Sticky { Cookie{Name,Secure,HTTPOnly,SameSite,MaxAge,Path,Domain} }
+          → (same wrr path as above)
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: true    # PR #12537 adds this; not yet merged
+    source_ip_affinity: true    # Via HRW load balancing strategy
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true
+      path: true        # Configurable, defaults to "/"
+      domain: true       # Added via PR #11556
+      ttl: true          # Via maxAge field (seconds)
+      secure: true
+      http_only: true
+      same_site: true    # none, lax, strict
+    idle_timeout: false
+    absolute_timeout: true    # Via maxAge on cookies; PR #12537 maps absoluteTimeout → maxAge
+    lifetime_type_session: true    # maxAge=0 means session cookie
+    lifetime_type_permanent: true  # maxAge>0 means persistent cookie
+
+  limitations:
+    - "Gateway API sessionPersistence is NOT YET MERGED — PR #12537 is open with status 'needs-design-review' as of April 2026"
+    - "Header-based sticky sessions are being added in PR #12537 but not yet in mainline Traefik"
+    - "No idleTimeout support — only absoluteTimeout (maxAge) is supported for cookies"
+    - "Gateway API → Traefik translation does not map cookie attributes (secure, httpOnly, sameSite, domain, path) from sessionPersistence — only sessionName and absoluteTimeout are translated"
+    - "When HTTPRoute targets a TraefikService backend, sessionPersistence on the HTTPRoute is IGNORED — TraefikService stickiness controls"
+    - "Cookie value encodes hashed backend address — security concern (backend identity leakage via hash)"
+    - "Multi-level stickiness requires cookies at every level — client must send multiple cookie key/value pairs"
+    - "HRW source IP affinity is not exposed via Gateway API — only available through native config"
+    - "No GRPCRoute sessionPersistence support yet (only HTTPRoute in PR #12537)"
+    - "XBackendTrafficPolicy support requires experimentalChannel=true"
+
+  known_issues:
+    - url: "https://github.com/traefik/traefik/issues/11243"
+      description: "Support sticky sessions features with Gateway API — P2 priority, open since Oct 2024"
+    - url: "https://github.com/traefik/traefik/pull/12537"
+      description: "PR implementing Gateway API sessionPersistence + XBackendTrafficPolicy — open since Jan 2026, status needs-design-review"
+    - url: "https://github.com/traefik/traefik/pull/12539"
+      description: "Alternate PR for sticky sessions — closed"
+    - url: "https://github.com/traefik/traefik/issues/11542"
+      description: "Allow configuring Domain property for sticky session cookies — addressed by PR #11556"
+    - url: "https://github.com/traefik/traefik/issues/6023"
+      description: "Sticky cookie path is always slash '/' — historical issue, path is now configurable"
+
+gwapi_assessment:
+  overview: |
+    Traefik does NOT currently support Gateway API sessionPersistence in its mainline release.
+    However, a comprehensive community PR (#12537) is open that adds both HTTPRoute.rule.sessionPersistence
+    and XBackendTrafficPolicy support. The PR is in "needs-design-review" status and has been
+    open since January 2026.
+
+    Traefik's architecture as an integrated proxy makes the translation relatively straightforward:
+    Gateway API sessionPersistence maps directly to Traefik's internal `dynamic.Sticky` config,
+    which is consumed by the built-in Go load balancer. No intermediate CRD or external dataplane
+    config is needed.
+
+    Key architectural consideration: When an HTTPRoute targets a TraefikService backend (Traefik's
+    proprietary CRD), the route-level sessionPersistence is deliberately IGNORED, and the
+    TraefikService's own sticky config takes precedence. This is a Traefik-specific behavior
+    that other implementations don't have.
+
+  route_inline:
+    difficulty: moderate
+    description: |
+      PR #12537 implements route-inline session persistence. The `convertSessionPersistence()`
+      function translates Gateway API's `SessionPersistence` to Traefik's `dynamic.Sticky`:
+      - `type: Cookie` → `dynamic.Sticky{Cookie: &Cookie{Name: sessionName, MaxAge: absoluteTimeout}}`
+      - `type: Header` → `dynamic.Sticky{Header: &Header{Name: sessionName}}`
+
+      The translation is direct and clean. However, several Gateway API fields are NOT mapped:
+      - `idleTimeout` is not supported
+      - Cookie attributes (secure, httpOnly, sameSite, domain, path) are not configurable via
+        Gateway API — only via native CRDs
+      - `cookieConfig.lifetimeType` is handled (Permanent → maxAge from absoluteTimeout,
+        Session → maxAge=0)
+
+      The PR is moderate difficulty because: (1) it's a community contribution still in design review,
+      (2) the TraefikService precedence behavior adds complexity, and (3) it extends the native
+      Sticky struct to support header mode which touches multiple code paths.
+    mapping_strategy: |
+      Direct translation: `HTTPRoute.rule.sessionPersistence` → `dynamic.Sticky{Cookie|Header}`
+      → `ServersLoadBalancer.Sticky` → `loadbalancer.Sticky` at runtime.
+      No intermediate API to translate through. Traefik's Gateway API provider converts
+      directly to its internal dynamic config model.
+    gotchas:
+      - "When HTTPRoute targets a TraefikService, sessionPersistence is SILENTLY IGNORED"
+      - "No idleTimeout support — not mapped, not rejected (silently ignored)"
+      - "Cookie attributes (secure, httpOnly, sameSite, path, domain) cannot be set via Gateway API"
+      - "Header-based sessions require the client to explicitly extract and replay the header"
+      - "PR #12537 is still in design review — API may change before merge"
+      - "absoluteTimeout only applies when cookieConfig.lifetimeType is Permanent"
+    code_changes_needed:
+      - "PR #12537 contains all needed changes — pending merge"
+      - "May need updates as GEP-1619 fields evolve"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      PR #12537 also implements XBackendTrafficPolicy support. The provider watches
+      XBackendTrafficPolicy resources, matches them to Services via targetRefs, and converts
+      their sessionPersistence to dynamic.Sticky. Key behaviors:
+
+      1. Route-inline sessionPersistence takes precedence over XBackendTrafficPolicy
+      2. TraefikService stickiness takes precedence over both
+      3. Multiple policies targeting the same Service are resolved by creation timestamp
+         (oldest wins), with alphabetical name as tiebreaker
+      4. Conflicting policies get status conditions with reason "Conflicted"
+      5. Requires `experimentalChannel: true` in provider config
+
+      The implementation is thorough, including proper status updates on policy resources.
+    mapping_strategy: |
+      XBackendTrafficPolicy.spec.sessionPersistence → convertSessionPersistence()
+      → dynamic.Sticky → ServersLoadBalancer.Sticky (same as route-inline path).
+      Precedence: TraefikService > HTTPRoute sessionPersistence > XBackendTrafficPolicy.
+    gotchas:
+      - "Requires experimentalChannel=true — disabled by default"
+      - "TraefikService stickiness overrides XBackendTrafficPolicy entirely"
+      - "Only targets Services (group='', kind=Service) — not other backend types"
+      - "Same cookie attribute limitations as route-inline (no secure/httpOnly/sameSite/path/domain)"
+      - "PR #12537 is still in design review — may change before merge"
+    code_changes_needed:
+      - "PR #12537 contains all needed changes — pending merge"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "dynamic.Sticky{Cookie: &Cookie{...}}"
+      mapping_difficulty: direct
+      notes: "Default type. Maps directly to Traefik's cookie-based sticky sessions."
+    - gwapi_field: "type: Header"
+      native_field: "dynamic.Sticky{Header: &Header{...}}"
+      mapping_difficulty: direct
+      notes: "Maps to Traefik's new header-based sticky sessions (PR #12537). Default header name X-Sticky-Session."
+    - gwapi_field: "sessionName"
+      native_field: "Cookie.Name or Header.Name"
+      mapping_difficulty: direct
+      notes: "Maps directly. If not set, cookie defaults to SHA-1 abbreviation, header defaults to X-Sticky-Session."
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: "Cookie with MaxAge=0 (session cookie)"
+      mapping_difficulty: direct
+      notes: "Default — session cookie that expires when browser closes."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: "Cookie with MaxAge from absoluteTimeout"
+      mapping_difficulty: direct
+      notes: "MaxAge set from absoluteTimeout (converted from duration to seconds)."
+    - gwapi_field: "absoluteTimeout"
+      native_field: "Cookie.MaxAge (only when lifetimeType=Permanent)"
+      mapping_difficulty: direct
+      notes: "Duration parsed and converted to integer seconds for MaxAge."
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "Not supported. Silently ignored (not rejected with error like in Envoy Gateway)."
+    - gwapi_field: "cookie secure/httpOnly/sameSite"
+      native_field: "Cookie.Secure, Cookie.HTTPOnly, Cookie.SameSite (native only)"
+      mapping_difficulty: not_supported
+      notes: "Traefik supports these natively but they are NOT mapped from Gateway API sessionPersistence. Only available via IngressRoute/TraefikService CRDs."
+    - gwapi_field: "cookie path"
+      native_field: "Cookie.Path (native only, defaults to '/')"
+      mapping_difficulty: not_supported
+      notes: "Traefik supports cookie path natively but it is NOT computed from route path match in Gateway API translation. Always defaults to '/'."
+    - gwapi_field: "cookie domain"
+      native_field: "Cookie.Domain (native only)"
+      mapping_difficulty: not_supported
+      notes: "Traefik supports cookie domain natively (since PR #11556) but not mapped from Gateway API."
+
+  deviations:
+    - "Traefik is an integrated proxy with no external dataplane — all session persistence is handled in Go code, not translated to Envoy/Nginx config"
+    - "When HTTPRoute targets a TraefikService backend, sessionPersistence is silently ignored — unique to Traefik"
+    - "Header-based sticky sessions are a Traefik-native addition not defined in GEP-1619's current scope"
+    - "Cookie attributes (secure, httpOnly, sameSite, path, domain) are supported natively but NOT exposed via Gateway API sessionPersistence"
+    - "idleTimeout is silently ignored rather than explicitly rejected"
+    - "No cookie path computation from route path match — always defaults to '/'"
+    - "Multi-level stickiness (WRR + per-service) is a Traefik-specific concept with no Gateway API equivalent"
+    - "XBackendTrafficPolicy precedence includes TraefikService as highest priority, which is implementation-specific"
+
+  overall_difficulty: moderate
+  summary: |
+    Traefik's Gateway API session persistence support is NOT YET MERGED but has a comprehensive
+    community PR (#12537) in design review. The PR implements both route-inline
+    (HTTPRoute.rule.sessionPersistence) and policy-based (XBackendTrafficPolicy) session persistence.
+
+    Key characteristics of Traefik's approach:
+    (1) Integrated proxy — no external dataplane translation needed. Gateway API sessionPersistence
+        maps directly to Traefik's internal dynamic.Sticky config.
+    (2) Supports both Cookie and Header persistence types (header support added by the same PR).
+    (3) Rich native cookie attributes (name, secure, httpOnly, sameSite, maxAge, path, domain)
+        but Gateway API translation only maps sessionName and absoluteTimeout.
+    (4) Unique TraefikService precedence — when HTTPRoute targets a TraefikService, the route's
+        sessionPersistence is silently ignored in favor of TraefikService's own sticky config.
+    (5) Source IP affinity is available via HRW load balancing but not exposed through Gateway API.
+
+    The main gaps are: (a) the PR is not yet merged and may undergo design changes, (b) many
+    cookie attributes are not mappable from Gateway API, (c) idleTimeout is not supported,
+    (d) no GRPCRoute support, and (e) cookie path is not computed from route path matches.
+
+    Overall, the translation model is clean (direct, no intermediate API), but the implementation
+    is moderate difficulty due to the TraefikService interaction complexity and the fact that the
+    PR is still in review. Traefik maintainers have acknowledged this is a priority but have
+    not committed to a timeline.
