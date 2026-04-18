@@ -1,0 +1,629 @@
+metadata:
+  name: GKE
+  type: cloud_managed
+  dataplane: Google Cloud Load Balancer
+  version_analyzed: "GKE 1.30.3-gke.1211000, gke-gateway-api v1.4.0, April 2026"
+  repo_url: https://github.com/GoogleCloudPlatform/gke-gateway-api
+  docs_url: https://docs.cloud.google.com/kubernetes-engine/docs/concepts/gateway-api
+  last_updated: 2026-04-17
+
+api_stack:
+  translation_model: intermediate
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute (core routing only — `sessionPersistence` field NOT supported)"
+        - "GRPCRoute"
+      description: |
+        User-facing API. GKE reads HTTPRoute for routing but does NOT support the upstream
+        `sessionPersistence` field on HTTPRoute rules. Session affinity is instead configured
+        via GKE-specific policy CRDs (GCPBackendPolicy, GCPTrafficDistributionPolicy,
+        GCPSessionAffinityFilter, GCPSessionAffinityPolicy).
+    - name: GKE Policy CRDs
+      type: intermediate
+      resources:
+        - "GCPBackendPolicy (networking.gke.io/v1)"
+        - "GCPTrafficDistributionPolicy (networking.gke.io/v1)"
+        - "GCPSessionAffinityFilter (networking.gke.io/v1)"
+        - "GCPSessionAffinityPolicy (networking.gke.io/v1)"
+      description: |
+        GKE-specific CRDs for configuring session affinity and traffic distribution. These are
+        the ONLY mechanism for session affinity on GKE Gateway — the upstream `sessionPersistence`
+        field is not recognized. `GCPBackendPolicy` provides basic session affinity (CLIENT_IP,
+        GENERATED_COOKIE). `GCPTrafficDistributionPolicy` provides advanced affinity (HTTP_COOKIE,
+        HEADER_FIELD) with cookie name/path/TTL. `GCPSessionAffinityFilter` allows route-rule-level
+        session affinity via ExtensionRef. `GCPSessionAffinityPolicy` provides policy attachment to
+        Services for stateful generated cookie (GSSA) affinity.
+    - name: Google Cloud Load Balancer Backend Service
+      type: dataplane
+      resources:
+        - "BackendService.sessionAffinity (NONE, CLIENT_IP, GENERATED_COOKIE, HTTP_COOKIE, HEADER_FIELD, STRONG_COOKIE_AFFINITY)"
+        - "BackendService.affinityCookieTtlSec"
+        - "BackendService.consistentHash (httpHeaderName, httpCookie, minimumRingSize)"
+        - "BackendService.localityLbPolicy (ROUND_ROBIN, MAGLEV, RING_HASH)"
+        - "BackendService.strongSessionAffinityCookie (name, path, ttl)"
+      description: |
+        The actual Google Cloud Load Balancer backend service configuration. GKE Gateway controller
+        translates GKE policy CRDs into backend service settings on Google Cloud Application Load
+        Balancers. The backend service supports multiple session affinity types, consistent hashing,
+        and cookie-based stateful affinity. The load balancer is a fully managed Google Cloud
+        infrastructure — not Envoy/Nginx running in the cluster (though Google's internal
+        infrastructure may use Envoy-based proxies).
+
+native_profile:
+  overview: |
+    Google Kubernetes Engine (GKE) implements Gateway API using the GKE Gateway controller
+    (`networking.gke.io/gateway`) which provisions and configures Google Cloud Application Load
+    Balancers as the dataplane. Unlike in-cluster proxy implementations (Envoy Gateway, Istio,
+    NGINX), the load balancing infrastructure is fully managed by Google Cloud — the user does
+    not deploy or manage proxy Pods.
+
+    Session affinity in GKE is configured exclusively through GKE-specific CRDs — the upstream
+    Gateway API `sessionPersistence` field on HTTPRoute rules is NOT supported. GKE provides
+    FOUR mechanisms for session affinity:
+
+    1. **GCPBackendPolicy** (legacy for session affinity):
+       Attaches to a Service via `targetRef`. Supports `CLIENT_IP`, `GENERATED_COOKIE`, and
+       `NONE` session affinity types. Does NOT support `HEADER_FIELD` or `HTTP_COOKIE` — for
+       those, use `GCPTrafficDistributionPolicy`. Provides `cookieTtlSec` for cookie expiration.
+
+    2. **GCPTrafficDistributionPolicy** (recommended for advanced affinity):
+       Attaches to Services via `targetRefs`. Supports `CLIENT_IP`, `GENERATED_COOKIE`,
+       `HTTP_COOKIE`, and `HEADER_FIELD`. For `HTTP_COOKIE`, allows configuration of cookie
+       name, path, and TTL. Requires `localityLbAlgorithm` of `MAGLEV` or `RING_HASH` for
+       header/cookie affinity. Takes precedence over `GCPBackendPolicy` if both target the
+       same Service.
+
+    3. **GCPSessionAffinityFilter** (route-rule-level via ExtensionRef):
+       Referenced as an `ExtensionRef` filter on HTTPRoute rules. Provides route-rule-level
+       session affinity using stateful generated cookies (GSSA). This is the closest GKE
+       equivalent to Gateway API's inline `sessionPersistence` — it attaches at the route-rule
+       level rather than the service level. The GSSA cookie encodes the destination host directly
+       into the cookie value, providing strong persistence.
+
+    4. **GCPSessionAffinityPolicy** (policy attachment for GSSA):
+       Policy attachment targeting Services for stateful generated cookie (GSSA) affinity.
+       Shares the same `GCPSessionAffinitySpec` as `GCPSessionAffinityFilter`.
+
+    GKE does NOT support `idleTimeout` for session affinity. The only timeout mechanism is
+    cookie TTL (`cookieTtlSec` or `cookie.ttl`), which functions as an absolute timeout from
+    cookie creation — not an idle/inactivity-based timeout. The Google Cloud Load Balancer
+    has a separate backend service `timeoutSec` (default 30s) and connection idle timeout
+    (default 600s), but these are connection-level timeouts, not session affinity timeouts.
+
+  mechanisms:
+    - name: GCPBackendPolicy Session Affinity
+      type: soft_affinity
+      description: |
+        Configures session affinity on the Google Cloud backend service via `GCPBackendPolicy`.
+        Supports `CLIENT_IP` (hash on source IP), `GENERATED_COOKIE` (load-balancer-generated
+        cookie named `GCLB` or `GCILB` depending on LB type), and `NONE`. This is a hash-based
+        mechanism — affinity can break when backends scale. Cookie TTL is configurable via
+        `cookieTtlSec`. Does NOT support `HEADER_FIELD` or `HTTP_COOKIE` — use
+        `GCPTrafficDistributionPolicy` for those.
+      enabled_by_default: false
+      configuration_method: "GCPBackendPolicy CRD (networking.gke.io/v1) targeting a Service"
+
+      config_options:
+        - field: sessionAffinity.type
+          type: "enum (CLIENT_IP, CLIENT_IP_PORT_PROTO, CLIENT_IP_PROTO, GENERATED_COOKIE, HEADER_FIELD, HTTP_COOKIE, NONE)"
+          required: false
+          default: NONE
+          description: |
+            Session affinity type. `GCPBackendPolicy` only effectively supports `CLIENT_IP`,
+            `GENERATED_COOKIE`, and `NONE`. For `HEADER_FIELD` or `HTTP_COOKIE`, use
+            `GCPTrafficDistributionPolicy`.
+          support_level: partial
+        - field: sessionAffinity.cookieTtlSec
+          type: integer
+          required: false
+          default: "0"
+          description: |
+            Lifetime of cookies in seconds. Requires `GENERATED_COOKIE` or `HTTP_COOKIE` session
+            affinity. If set to 0, the cookie is non-persistent (session cookie). Maximum value is
+            two weeks (1,209,600 seconds).
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "GCPBackendPolicy (networking.gke.io/v1)"
+        scope: "per-service"
+
+    - name: GCPTrafficDistributionPolicy Session Affinity
+      type: soft_affinity
+      description: |
+        Advanced session affinity via `GCPTrafficDistributionPolicy`. Supports all affinity types
+        including `HTTP_COOKIE` with custom cookie name/path/TTL and `HEADER_FIELD` with custom
+        header name. Requires `localityLbAlgorithm` of `MAGLEV` or `RING_HASH` for cookie/header
+        affinity. Takes precedence over `GCPBackendPolicy`. Single-cluster Gateways only.
+      enabled_by_default: false
+      configuration_method: "GCPTrafficDistributionPolicy CRD (networking.gke.io/v1) targeting Services"
+
+      config_options:
+        - field: sessionAffinity.type
+          type: "enum (CLIENT_IP, GENERATED_COOKIE, HTTP_COOKIE, HEADER_FIELD)"
+          required: false
+          default: null
+          description: "Session affinity type. `HTTP_COOKIE` and `HEADER_FIELD` require `MAGLEV` or `RING_HASH` locality LB algorithm."
+          support_level: full
+        - field: sessionAffinity.cookie.name
+          type: string
+          required: false
+          default: null
+          description: "Custom cookie name for `HTTP_COOKIE` affinity. The load balancer generates a cookie with this name."
+          support_level: full
+        - field: sessionAffinity.cookie.path
+          type: string
+          required: false
+          default: "/"
+          description: "Cookie path attribute for `HTTP_COOKIE` affinity."
+          support_level: full
+        - field: sessionAffinity.cookie.ttl
+          type: duration
+          required: false
+          default: "0 (session cookie)"
+          description: "Cookie TTL as a duration string (e.g., '1h'). If 0 or unset, the cookie is a session cookie with no Expires attribute."
+          support_level: full
+        - field: sessionAffinity.httpHeaderName
+          type: string
+          required: false
+          default: null
+          description: "HTTP header name for `HEADER_FIELD` affinity. Requests with the same header value are routed to the same backend."
+          support_level: full
+        - field: localityLbAlgorithm
+          type: "enum (ROUND_ROBIN, LEAST_REQUEST, RING_HASH, RANDOM, ORIGINAL_DESTINATION, MAGLEV, WEIGHTED_ROUND_ROBIN)"
+          required: false
+          default: "ROUND_ROBIN (if no affinity), MAGLEV (if affinity is set)"
+          description: "Load balancing algorithm. Must be `MAGLEV` or `RING_HASH` for `HEADER_FIELD` or `HTTP_COOKIE` affinity."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "GCPTrafficDistributionPolicy (networking.gke.io/v1)"
+        scope: "per-service"
+
+    - name: GCPSessionAffinityFilter (Stateful Generated Cookie / GSSA)
+      type: strong_persistence
+      description: |
+        Route-rule-level session affinity using stateful generated cookies (GSSA). Referenced as
+        an `ExtensionRef` filter on HTTPRoute rules. The data plane generates a session cookie
+        named "GSSA" that encodes the specific destination host. Unlike hash-based affinity,
+        GSSA provides strong persistence — the cookie value contains the actual backend identity,
+        so requests are directed to the exact same host as long as it remains healthy. This is
+        GKE's equivalent of Envoy's `stateful_session` filter.
+
+        Use case: when session affinity must apply to a route rule (e.g., with traffic splitting),
+        rather than to a specific service. The filter overrides traffic splitting weights for
+        clients with an established session.
+      enabled_by_default: false
+      configuration_method: "GCPSessionAffinityFilter CRD (networking.gke.io/v1) referenced via ExtensionRef on HTTPRoute rule"
+
+      config_options:
+        - field: statefulGeneratedCookie.cookieTtlSeconds
+          type: integer
+          required: false
+          default: null
+          description: |
+            TTL for the GSSA cookie in seconds. Valid range is 1 to 86,400 (24 hours).
+            The cookie name is always "GSSA" — not configurable.
+          support_level: full
+
+      attachment_model:
+        attaches_to: Route Rule
+        resource_type: "GCPSessionAffinityFilter (networking.gke.io/v1) via ExtensionRef"
+        scope: "per-route-rule"
+
+    - name: GCPSessionAffinityPolicy (Stateful Generated Cookie / GSSA)
+      type: strong_persistence
+      description: |
+        Policy attachment for stateful generated cookie (GSSA) affinity targeting Services.
+        Shares the same `GCPSessionAffinitySpec` as `GCPSessionAffinityFilter` but attaches
+        at the service level via `targetRef`. Provides strong persistence using GSSA cookies
+        that encode the destination host.
+      enabled_by_default: false
+      configuration_method: "GCPSessionAffinityPolicy CRD (networking.gke.io/v1) targeting a Service"
+
+      config_options:
+        - field: statefulGeneratedCookie.cookieTtlSeconds
+          type: integer
+          required: false
+          default: null
+          description: "TTL for the GSSA cookie in seconds. Valid range is 1 to 86,400 (24 hours)."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "GCPSessionAffinityPolicy (networking.gke.io/v1)"
+        scope: "per-service"
+
+  attachment_points:
+    - mechanism: GCPBackendPolicy Session Affinity
+      layer: backend_service
+      native_resource: "GCPBackendPolicy (networking.gke.io/v1)"
+      description: |
+        Attaches to a Kubernetes Service via `targetRef`. Translates to Google Cloud backend
+        service `sessionAffinity` and `affinityCookieTtlSec` settings. For multi-cluster
+        Gateways, targets ServiceImport instead of Service.
+    - mechanism: GCPTrafficDistributionPolicy Session Affinity
+      layer: backend_service
+      native_resource: "GCPTrafficDistributionPolicy (networking.gke.io/v1)"
+      description: |
+        Attaches to Services via `targetRefs`. Provides advanced session affinity with cookie
+        name/path/TTL and header-based affinity. Translates to backend service `sessionAffinity`,
+        `consistentHash`, and `localityLbPolicy` settings. Single-cluster Gateways only.
+    - mechanism: GCPSessionAffinityFilter (Stateful Generated Cookie / GSSA)
+      layer: route_rule
+      native_resource: "GCPSessionAffinityFilter (networking.gke.io/v1) via ExtensionRef"
+      description: |
+        Attaches at the route-rule level via HTTPRoute `ExtensionRef` filter. This is the only
+        GKE mechanism that attaches at the route-rule level rather than the service level.
+        Provides strong persistence via GSSA cookies. Used when session affinity must override
+        traffic splitting weights.
+    - mechanism: GCPSessionAffinityPolicy (Stateful Generated Cookie / GSSA)
+      layer: backend_service
+      native_resource: "GCPSessionAffinityPolicy (networking.gke.io/v1)"
+      description: |
+        Policy attachment targeting Services for GSSA stateful cookie affinity. Attaches at the
+        service level via `targetRef`.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "not implemented (GKE does not support upstream sessionPersistence field)"
+      dataplane_target:
+        name: "GCPSessionAffinityFilter via ExtensionRef (closest equivalent)"
+        label: "alternative mechanism"
+    btp:
+      target_layer: backend_service
+      label: "not implemented (GKE uses GCPBackendPolicy / GCPTrafficDistributionPolicy instead)"
+      dataplane_target:
+        name: "GCPBackendPolicy / GCPTrafficDistributionPolicy"
+        label: "alternative mechanism"
+
+  dataplane_translation:
+    description: |
+      GKE Gateway controller translates GKE-specific CRDs into Google Cloud Load Balancer
+      backend service configurations. The controller is a managed component running in the
+      GKE control plane — its source code is not publicly available. The translation targets
+      the Google Cloud Compute Engine BackendService API.
+
+      Translation flow for session affinity:
+
+      1. `GCPBackendPolicy` -> BackendService API:
+         - `sessionAffinity.type: GENERATED_COOKIE` -> `BackendService.sessionAffinity = GENERATED_COOKIE`
+         - `sessionAffinity.cookieTtlSec: 50` -> `BackendService.affinityCookieTtlSec = 50`
+         - Automatically sets `localityLbPolicy = MAGLEV` when affinity is non-NONE
+
+      2. `GCPTrafficDistributionPolicy` -> BackendService API:
+         - `sessionAffinity.type: HTTP_COOKIE` -> `BackendService.sessionAffinity = HTTP_COOKIE`
+         - `cookie.name/path/ttl` -> `BackendService.consistentHash.httpCookie.*`
+         - `localityLbAlgorithm: RING_HASH` -> `BackendService.localityLbPolicy = RING_HASH`
+
+      3. `GCPSessionAffinityFilter` / `GCPSessionAffinityPolicy` -> BackendService API:
+         - `statefulGeneratedCookie` -> Translated to stateful session cookie configuration
+           on the backend service. The GSSA cookie encodes the destination host identity.
+
+      The GKE Gateway controller manages the full lifecycle of Google Cloud Load Balancer
+      resources: URL maps, target proxies, forwarding rules, backend services, health checks,
+      and NEGs (Network Endpoint Groups).
+    envoy_features_used:
+      - "N/A — GKE uses Google Cloud Load Balancers, not in-cluster Envoy"
+      - "Google Cloud BackendService.sessionAffinity"
+      - "Google Cloud BackendService.affinityCookieTtlSec"
+      - "Google Cloud BackendService.consistentHash"
+      - "Google Cloud BackendService.localityLbPolicy"
+      - "Google Cloud BackendService.strongSessionAffinityCookie (underlying API)"
+    key_code_paths:
+      - "GKE Gateway controller source is not publicly available (managed by Google)"
+      - "github.com/GoogleCloudPlatform/gke-gateway-api/apis/networking/v1/gcpbackendpolicy_types.go — GCPBackendPolicy and SessionAffinityConfig types"
+      - "github.com/GoogleCloudPlatform/gke-gateway-api/apis/networking/v1/gcptrafficdistributionpolicy_types.go — GCPTrafficDistributionPolicy types"
+      - "github.com/GoogleCloudPlatform/gke-gateway-api/apis/networking/v1/gcpsessionaffinityfilter_types.go — GCPSessionAffinityFilter types"
+      - "github.com/GoogleCloudPlatform/gke-gateway-api/apis/networking/v1/gcpsessionaffinitypolicy_types.go — GCPSessionAffinityPolicy and GCPSessionAffinitySpec types"
+    flow: |
+      GCPBackendPolicy (basic affinity):
+        GCPBackendPolicy.spec.default.sessionAffinity
+          -> GKE Gateway Controller (managed, closed-source)
+            -> Google Cloud Compute API: BackendService {
+                 sessionAffinity: GENERATED_COOKIE / CLIENT_IP / NONE
+                 affinityCookieTtlSec: <value>
+                 localityLbPolicy: MAGLEV (auto-set when affinity != NONE)
+               }
+
+      GCPTrafficDistributionPolicy (advanced affinity):
+        GCPTrafficDistributionPolicy.spec.default.sessionAffinity
+          -> GKE Gateway Controller
+            -> Google Cloud Compute API: BackendService {
+                 sessionAffinity: HTTP_COOKIE / HEADER_FIELD / GENERATED_COOKIE / CLIENT_IP
+                 consistentHash: {
+                   httpCookie: { name, path, ttl }
+                   httpHeaderName: <header>
+                   minimumRingSize: <size>
+                 }
+                 localityLbPolicy: MAGLEV / RING_HASH
+               }
+
+      GCPSessionAffinityFilter (GSSA, route-rule-level):
+        HTTPRoute.rule.filters[ExtensionRef] -> GCPSessionAffinityFilter.spec.statefulGeneratedCookie
+          -> GKE Gateway Controller
+            -> Stateful session cookie (GSSA) configuration on backend service
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: true    # Via HEADER_FIELD affinity (hash-based, not strong persistence)
+    source_ip_affinity: true    # Via CLIENT_IP affinity
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true     # Via GCPTrafficDistributionPolicy HTTP_COOKIE cookie.name; NOT for GENERATED_COOKIE (auto-named GCLB/GCILB) or GSSA
+      path: true     # Via GCPTrafficDistributionPolicy HTTP_COOKIE cookie.path; GENERATED_COOKIE always uses "/"
+      domain: false  # Not configurable
+      ttl: true      # Via cookieTtlSec (GCPBackendPolicy) or cookie.ttl (GCPTrafficDistributionPolicy) or cookieTtlSeconds (GSSA)
+      secure: false  # Not configurable
+      http_only: false  # Not configurable
+      same_site: false  # Not configurable
+    idle_timeout: false    # NOT SUPPORTED — GKE/Google Cloud Load Balancer has no idle timeout for session affinity. Only cookie TTL (absolute timeout) is available.
+    absolute_timeout: true  # Via cookie TTL
+    lifetime_type_session: true   # TTL=0 creates a session cookie (no Expires attribute)
+    lifetime_type_permanent: true  # TTL>0 creates a persistent cookie with Expires
+
+  limitations:
+    - "Does NOT support Gateway API `sessionPersistence` field on HTTPRoute rules — session affinity must be configured via GKE-specific CRDs"
+    - "Does NOT support `idleTimeout` — only cookie TTL (absolute timeout) is available; there is no idle/inactivity-based session timeout"
+    - "GSSA (stateful generated cookie) cookie name is always 'GSSA' — not configurable"
+    - "GENERATED_COOKIE cookie name is always 'GCLB' (external) or 'GCILB' (internal) — not configurable"
+    - "GSSA cookie TTL is limited to 1-86,400 seconds (24 hours maximum)"
+    - "Regular cookie TTL is limited to 0-1,209,600 seconds (two weeks maximum)"
+    - "GCPTrafficDistributionPolicy session affinity is supported for single-cluster Gateways only — not available on multi-cluster Gateways"
+    - "Weighted traffic splitting takes precedence over session affinity — avoid combining them on the same route rule"
+    - "Cookie Secure, HttpOnly, SameSite, and Domain attributes are not configurable"
+    - "HEADER_FIELD and HTTP_COOKIE affinity require MAGLEV or RING_HASH locality LB algorithm"
+    - "Session affinity (except GSSA/STRONG_COOKIE_AFFINITY) can break when backends scale or fail health checks"
+    - "GCPBackendPolicy does not support HEADER_FIELD or HTTP_COOKIE — must use GCPTrafficDistributionPolicy for those"
+    - "GKE Gateway controller source code is closed-source — debugging requires relying on Google Cloud support"
+    - "No support for GRPCRoute `sessionPersistence` field"
+    - "STRONG_COOKIE_AFFINITY from the underlying Compute API is not directly exposed through GKE Gateway CRDs — only available via GSSA mechanism"
+    - "The `GCPSessionAffinityFilter` ExtensionRef approach is non-portable across Gateway API implementations"
+
+  known_issues:
+    - url: "https://github.com/kubernetes/ingress-gce/issues/516"
+      description: "Long-standing issue tracking session affinity support for GCE Ingress. Session affinity via annotations has been a pain point historically."
+    - url: "https://github.com/kubernetes/kubernetes/issues/51711"
+      description: "Ingress controller session affinity via cookies do not work with GCP — historical issue showing challenges with GCE cookie affinity."
+    - url: "https://github.com/kubernetes-sigs/gateway-api/discussions/2275"
+      description: "Gateway API Plugins discussion where GKE's ExtensionRef filter approach (GCPSessionAffinityFilter) is described as a use case for custom Gateway API filters."
+
+gwapi_assessment:
+  overview: |
+    GKE does NOT support Gateway API's upstream `sessionPersistence` field on HTTPRoute or
+    GRPCRoute rules. Instead, GKE provides its own ecosystem of GKE-specific CRDs for session
+    affinity configuration: `GCPBackendPolicy`, `GCPTrafficDistributionPolicy`,
+    `GCPSessionAffinityFilter`, and `GCPSessionAffinityPolicy`.
+
+    This is architecturally consistent with how GKE handles other extended Gateway API features.
+    GKE also does not support HTTPRoute `timeouts` — instead using `GCPBackendPolicy.timeoutSec`.
+    GKE's philosophy is to expose Google Cloud Load Balancer features through GKE-native CRDs
+    rather than adopting upstream experimental Gateway API fields.
+
+    GKE's `GCPSessionAffinityFilter` (referenced via ExtensionRef on HTTPRoute rules) is the
+    closest equivalent to route-inline `sessionPersistence`. It provides strong persistence via
+    GSSA cookies that encode the destination host. However, it is limited to GSSA cookies only —
+    no custom cookie name, no header-based persistence, no `absoluteTimeout` or `idleTimeout` in
+    the Gateway API sense.
+
+    For service-level session affinity, GKE uses `GCPBackendPolicy` and
+    `GCPTrafficDistributionPolicy`. These map conceptually to a BackendLBPolicy-like model but
+    use GKE-specific field names and types rather than Gateway API's `SessionPersistence` struct.
+
+    **CRITICAL: idleTimeout is NOT supported.** Google Cloud Load Balancers have no concept of
+    an idle/inactivity-based session affinity timeout. The only timeout mechanism is cookie TTL,
+    which is an absolute timeout from cookie creation. The backend service `timeoutSec` and
+    connection idle timeout (600s default) are connection-level timeouts, not session affinity
+    timeouts.
+
+  route_inline:
+    difficulty: significant
+    description: |
+      GKE does NOT support Gateway API's inline `sessionPersistence` field on HTTPRoute rules.
+      The `sessionPersistence` field is an Extended conformance feature, and GKE has chosen not
+      to implement it.
+
+      GKE's alternative is `GCPSessionAffinityFilter` referenced via ExtensionRef on HTTPRoute
+      rules. This provides route-rule-level session affinity but only supports GSSA stateful
+      generated cookies — not the full `SessionPersistence` spec (no custom session name, no
+      header-based persistence, no cookie lifetime type, no `absoluteTimeout`/`idleTimeout`).
+
+      Implementing upstream `sessionPersistence` would require:
+      1. Parsing the `sessionPersistence` field from HTTPRoute rules
+      2. Mapping `type: Cookie` to `GENERATED_COOKIE`, `HTTP_COOKIE`, or GSSA on the backend
+         service, depending on whether strong persistence is needed
+      3. Mapping `type: Header` to `HEADER_FIELD` on the backend service
+      4. Mapping `sessionName` to `consistentHash.httpCookie.name` or `consistentHash.httpHeaderName`
+      5. Mapping `absoluteTimeout` to `affinityCookieTtlSec` or `cookie.ttl`
+      6. Mapping `cookieConfig.lifetimeType` to TTL=0 (Session) or TTL>0 (Permanent)
+      7. `idleTimeout` has no native equivalent — would need to be rejected or ignored
+
+      The significant difficulty is because: (a) the GKE Gateway controller is closed-source and
+      managed by Google, (b) the translation target is a cloud API (Compute BackendService) with
+      different abstractions than Envoy, and (c) `idleTimeout` has no mapping at all.
+    mapping_strategy: |
+      GKE currently uses ExtensionRef-based route-level session affinity (GCPSessionAffinityFilter)
+      rather than the upstream `sessionPersistence` field. To support `sessionPersistence`, the
+      GKE Gateway controller would need to:
+      - Parse `rule.sessionPersistence` from HTTPRoute
+      - Map `type: Cookie` -> BackendService `sessionAffinity = HTTP_COOKIE` or GSSA depending
+        on persistence strength requirements
+      - Map `type: Header` -> BackendService `sessionAffinity = HEADER_FIELD`
+      - Map `sessionName` -> `consistentHash.httpCookie.name` or `consistentHash.httpHeaderName`
+      - Map `absoluteTimeout` -> `affinityCookieTtlSec` or `consistentHash.httpCookie.ttl`
+      - Map `cookieConfig.lifetimeType: Session` -> TTL = 0
+      - Map `cookieConfig.lifetimeType: Permanent` -> TTL from absoluteTimeout
+      - Reject or ignore `idleTimeout` (no native equivalent)
+    gotchas:
+      - "GKE Gateway controller is closed-source — changes can only be made by Google"
+      - "`idleTimeout` has no mapping to any Google Cloud Load Balancer feature"
+      - "Google Cloud LB cookie names are constrained — GSSA is always 'GSSA', GENERATED_COOKIE is always 'GCLB'/'GCILB'"
+      - "Only `HTTP_COOKIE` in `GCPTrafficDistributionPolicy` supports custom cookie names"
+      - "GSSA provides strong persistence but is limited to 24-hour TTL maximum"
+      - "Regular cookie TTL is limited to two weeks — no 1-year defaults like Envoy-based implementations"
+      - "Cookie path defaults to '/' on Google Cloud LB — no per-route path computation"
+      - "Route-rule-level affinity via ExtensionRef is GKE-specific and non-portable"
+    code_changes_needed:
+      - "GKE Gateway controller (closed-source, managed by Google) would need to be updated to parse sessionPersistence from HTTPRoute"
+      - "Cannot be implemented by end users — requires Google engineering work"
+      - "Google would need to map sessionPersistence fields to Compute BackendService API"
+      - "idleTimeout would need to be explicitly rejected or documented as unsupported"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      GKE already has service-level session affinity via `GCPBackendPolicy` and
+      `GCPTrafficDistributionPolicy`. These are conceptually similar to a BackendLBPolicy
+      but use GKE-specific CRD types and field names.
+
+      Implementing Gateway API's `BackendLBPolicy` would require:
+      1. Creating a new `BackendLBPolicy` resource (or mapping to existing GCPBackendPolicy/
+         GCPTrafficDistributionPolicy)
+      2. Translating `sessionPersistence` fields to existing backend service affinity settings
+      3. Handling precedence between `BackendLBPolicy` and existing GKE CRDs
+
+      The moderate difficulty is because the underlying backend service already supports the
+      needed affinity features — it is primarily an API mapping exercise. However, `idleTimeout`
+      still has no native equivalent.
+    mapping_strategy: |
+      Option A: Implement Gateway API `BackendLBPolicy` as a new CRD:
+        - `sessionPersistence` -> BackendService.sessionAffinity + cookie/header config
+        - Would coexist with GCPBackendPolicy and GCPTrafficDistributionPolicy
+
+      Option B: Map BackendLBPolicy fields to existing GCPTrafficDistributionPolicy:
+        - `type: Cookie` -> `sessionAffinity.type: HTTP_COOKIE` with cookie config
+        - `type: Header` -> `sessionAffinity.type: HEADER_FIELD` with header config
+        - `absoluteTimeout` -> `cookie.ttl`
+        - `sessionName` -> `cookie.name` or `httpHeaderName`
+
+      Either approach would reuse the existing backend service translation logic.
+    gotchas:
+      - "Precedence between BackendLBPolicy and GCPBackendPolicy/GCPTrafficDistributionPolicy needs clear definition"
+      - "`idleTimeout` has no native equivalent on Google Cloud Load Balancer"
+      - "GCPTrafficDistributionPolicy is single-cluster only — BackendLBPolicy would inherit this limitation"
+      - "Existing users may need migration path from GKE-specific CRDs to BackendLBPolicy"
+    code_changes_needed:
+      - "GKE Gateway controller (closed-source) would need BackendLBPolicy support"
+      - "CRD definition and validation for BackendLBPolicy"
+      - "Translation of sessionPersistence fields to backend service API"
+      - "Precedence logic between BackendLBPolicy and GKE-native CRDs"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "GCPTrafficDistributionPolicy sessionAffinity.type: HTTP_COOKIE (hash-based) or GCPSessionAffinityFilter statefulGeneratedCookie (GSSA, strong)"
+      mapping_difficulty: translation_needed
+      notes: |
+        Gateway API `type: Cookie` maps to either `HTTP_COOKIE` (hash-based, custom name/path/TTL)
+        or GSSA stateful generated cookie (strong persistence, fixed name 'GSSA'). The choice
+        depends on whether the user needs strong persistence (GSSA) or soft affinity (HTTP_COOKIE).
+        Gateway API does not distinguish between these — the `type: Cookie` field implies strong
+        persistence per GEP-1619.
+    - gwapi_field: "type: Header"
+      native_field: "GCPTrafficDistributionPolicy sessionAffinity.type: HEADER_FIELD with httpHeaderName"
+      mapping_difficulty: translation_needed
+      notes: |
+        Gateway API `type: Header` maps to `HEADER_FIELD` affinity. However, `HEADER_FIELD` is
+        hash-based (soft affinity), not strong persistence. The header value is hashed to select
+        a backend, but the backend is not encoded in the response. This is a semantic mismatch
+        with GEP-1619 which defines session persistence as strong.
+    - gwapi_field: "sessionName"
+      native_field: "GCPTrafficDistributionPolicy cookie.name (for HTTP_COOKIE) or httpHeaderName (for HEADER_FIELD)"
+      mapping_difficulty: translation_needed
+      notes: |
+        Maps to `cookie.name` for HTTP_COOKIE or `httpHeaderName` for HEADER_FIELD. Not available
+        for GENERATED_COOKIE (always 'GCLB'/'GCILB') or GSSA (always 'GSSA').
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: "cookieTtlSec = 0 or cookie.ttl = 0 (no Expires attribute, session cookie)"
+      mapping_difficulty: direct
+      notes: "TTL of 0 creates a session cookie. Behavior depends on client — browsers retain until session ends."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: "cookieTtlSec > 0 or cookie.ttl with duration (persistent cookie with Expires)"
+      mapping_difficulty: direct
+      notes: "TTL > 0 creates a persistent cookie. Must be set from absoluteTimeout value."
+    - gwapi_field: "absoluteTimeout"
+      native_field: "cookieTtlSec (GCPBackendPolicy) or cookie.ttl (GCPTrafficDistributionPolicy) or cookieTtlSeconds (GSSA)"
+      mapping_difficulty: direct
+      notes: |
+        Direct mapping to cookie TTL. Note maximum value constraints: GSSA max 86,400s (24h),
+        regular cookie max 1,209,600s (2 weeks). Gateway API has no maximum constraint.
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: |
+        NOT SUPPORTED. Google Cloud Load Balancer has NO idle/inactivity-based timeout for session
+        affinity. The only timeout mechanism is cookie TTL (absolute timeout from creation). The
+        backend service `timeoutSec` and connection idle timeout (600s default) are connection-level
+        timeouts, not session affinity timeouts. There is no way to implement idleTimeout on
+        Google Cloud Load Balancer infrastructure.
+    - gwapi_field: "cookie path (computed)"
+      native_field: "GCPTrafficDistributionPolicy cookie.path (for HTTP_COOKIE) or '/' default (GENERATED_COOKIE)"
+      mapping_difficulty: direct
+      notes: "Cookie path is configurable for HTTP_COOKIE via GCPTrafficDistributionPolicy. GENERATED_COOKIE always uses '/'."
+
+  deviations:
+    - "GKE does NOT support the upstream `sessionPersistence` field on HTTPRoute — uses GKE-specific CRDs instead"
+    - "GKE uses GCPSessionAffinityFilter (ExtensionRef) for route-rule-level affinity instead of inline sessionPersistence"
+    - "GKE has FOUR different CRDs for session affinity (GCPBackendPolicy, GCPTrafficDistributionPolicy, GCPSessionAffinityFilter, GCPSessionAffinityPolicy) — complex ecosystem"
+    - "GSSA provides strong persistence (encodes destination host in cookie) but cookie name is fixed as 'GSSA' and TTL max is 24 hours"
+    - "HEADER_FIELD affinity is hash-based (soft), not strong persistence — semantic mismatch with GEP-1619"
+    - "Cookie TTL maximum is 2 weeks (1,209,600s) for regular cookies, 24 hours for GSSA — no 1-year defaults"
+    - "No idleTimeout support — fundamentally not available on Google Cloud Load Balancer architecture"
+    - "GCPTrafficDistributionPolicy session affinity is single-cluster only"
+    - "Weighted traffic splitting takes precedence over session affinity — GKE-specific behavior"
+    - "Cookie Secure, HttpOnly, SameSite, Domain attributes are not configurable"
+    - "GCPBackendPolicy is considered legacy for session affinity — Google recommends GCPTrafficDistributionPolicy"
+    - "STRONG_COOKIE_AFFINITY from the Compute API (with custom cookie name/path/TTL for strong persistence) is not exposed through GKE Gateway CRDs"
+
+  overall_difficulty: significant
+  summary: |
+    GKE presents a SIGNIFICANT challenge for Gateway API session persistence (GEP-1619) because:
+
+    (1) GKE does NOT support the upstream `sessionPersistence` field on HTTPRoute rules. Session
+        affinity is exclusively configured via GKE-specific CRDs (GCPBackendPolicy,
+        GCPTrafficDistributionPolicy, GCPSessionAffinityFilter, GCPSessionAffinityPolicy).
+
+    (2) **idleTimeout is NOT supported and CANNOT be supported** on Google Cloud Load Balancers.
+        The only timeout mechanism is cookie TTL (absolute timeout). There is no concept of an
+        idle/inactivity-based session timeout in Google Cloud's load balancing infrastructure.
+        This is a fundamental architectural limitation — not a feature gap that can be addressed
+        by the GKE Gateway controller.
+
+    (3) GKE has a fragmented session affinity model with FOUR different CRDs, each supporting
+        different affinity types and attachment points. Mapping Gateway API's unified
+        `SessionPersistence` struct to this ecosystem requires careful translation.
+
+    (4) The GKE Gateway controller is closed-source — implementing upstream `sessionPersistence`
+        support requires Google engineering effort and cannot be contributed by the community.
+
+    (5) Semantic mismatches exist: GEP-1619 defines session persistence as "strong" (guaranteed
+        routing to the same backend), but GKE's most flexible affinity types (HTTP_COOKIE,
+        HEADER_FIELD, GENERATED_COOKIE) are hash-based (soft affinity). Only GSSA provides
+        strong persistence, but it has a fixed cookie name ("GSSA") and a 24-hour TTL maximum.
+
+    The positive aspects are:
+    - GKE DOES have route-rule-level session affinity via GCPSessionAffinityFilter (ExtensionRef)
+    - GKE DOES have service-level session affinity via multiple CRDs
+    - Cookie TTL (absolute timeout) is well-supported with configurable values
+    - GSSA provides genuine strong persistence (destination host encoded in cookie)
+    - HTTP_COOKIE supports custom cookie name, path, and TTL
+    - Header-based affinity is available (though hash-based, not strong)
+
+    GKE conformance: GKE has submitted conformance reports for v1.1.0 (standard channel,
+    GATEWAY_HTTP profile) for three GatewayClasses: `gke-l7-global-external-managed`,
+    `gke-l7-regional-external-managed`, and `gke-l7-rilb`. Session persistence tests are not
+    part of the standard channel conformance profile.
+
+    GatewayClasses provided by GKE:
+    - `gke-l7-global-external-managed` (global external Application LB)
+    - `gke-l7-regional-external-managed` (regional external Application LB)
+    - `gke-l7-rilb` (regional internal Application LB)
+    - `gke-l7-gxlb` (classic global external LB)
+    - `gke-l7-global-external-managed-mc` (multi-cluster global external)
+    - `gke-l7-regional-external-managed-mc` (multi-cluster regional external)
+    - `gke-l7-rilb-mc` (multi-cluster regional internal)
+    - `gke-l7-gxlb-mc` (multi-cluster classic global external)
+    - `gke-l7-cross-regional-internal-managed-mc` (cross-regional internal multi-cluster)

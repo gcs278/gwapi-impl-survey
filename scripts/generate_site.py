@@ -136,12 +136,13 @@ def render_api_stack_diagram(impl: dict) -> str:
         resources = layer.get("resources", [])
         desc = layer.get("description", "")
 
-        # Build resource list for the node
-        res_lines = "<br/>".join(f"<code>{r}</code>" for r in resources[:4])
+        # Build resource list for the node — strip backticks (invalid in Mermaid labels)
+        cleaned = [r.replace("`", "") for r in resources[:4]]
+        res_lines = "<br/>".join(cleaned)
         if len(resources) > 4:
             res_lines += f"<br/><i>+{len(resources)-4} more</i>"
 
-        lines.append(f'    {node_id}["{layer["name"]}<br/>---<br/>{res_lines}"]')
+        lines.append(f'    {node_id}["{layer["name"]}<br/><i>────────</i><br/>{res_lines}"]')
         lines.append(f'    class {node_id} {ltype}')
 
         # Arrow between layers
@@ -322,10 +323,20 @@ def render_ingress_model_diagram(impl):
     svc = imm.get("backend_service", {})
     ep = imm.get("endpoint", {})
 
-    gw_concept = gw.get("envoy_concept", "Gateway")
-    rr_concept = rr.get("envoy_concept", "Route")
-    svc_concept = svc.get("envoy_concept", "Service")
-    ep_concept = ep.get("envoy_concept", "Endpoint")
+    def mermaid_safe(s):
+        return s.replace("`", "").replace('"', "'")
+
+    # Try envoy_concept first, fall back to haproxy_concept/nginx_concept, then generic
+    def get_concept(layer, default):
+        for key in ("envoy_concept", "haproxy_concept", "nginx_concept", "concept"):
+            if key in layer:
+                return mermaid_safe(layer[key])
+        return default
+
+    gw_concept = get_concept(gw, "Gateway")
+    rr_concept = get_concept(rr, "Route")
+    svc_concept = get_concept(svc, "Service")
+    ep_concept = get_concept(ep, "Endpoint")
 
     # Session persistence config items
     gw_sp = gw.get("session_persistence_config", [])
@@ -333,11 +344,20 @@ def render_ingress_model_diagram(impl):
     svc_sp = svc.get("session_persistence_config", [])
 
     def sp_lines(items):
-        return "<br/>".join(items[:3]) if items else ""
+        if not items:
+            return ""
+        # Sanitize for Mermaid: strip chars that break Mermaid syntax
+        cleaned = []
+        for item in items[:3]:
+            s = item.replace("`", "").replace('"', "'").replace("<", "‹").replace(">", "›").replace("|", "/")
+            if len(s) > 60:
+                s = s[:57] + "..."
+            cleaned.append(s)
+        return "<br/>".join(cleaned)
 
-    gw_sp_html = f"<br/>---<br/>{sp_lines(gw_sp)}" if gw_sp else ""
-    rr_sp_html = f"<br/>---<br/>{sp_lines(rr_sp)}" if rr_sp else ""
-    svc_sp_html = f"<br/>---<br/>{sp_lines(svc_sp)}" if svc_sp else ""
+    gw_sp_html = f"<br/><i>────</i><br/>{sp_lines(gw_sp)}" if gw_sp else ""
+    rr_sp_html = f"<br/><i>────</i><br/>{sp_lines(rr_sp)}" if rr_sp else ""
+    svc_sp_html = f"<br/><i>────</i><br/>{sp_lines(svc_sp)}" if svc_sp else ""
 
     return f"""graph LR
     CLIENT["Client"] --> GW
@@ -749,6 +769,42 @@ def render_detail_diagram(impl: dict) -> str:
     """Implementation-specific detailed architecture diagram (config flow)."""
     name = impl["metadata"]["name"]
 
+    if name == "GKE":
+        return """graph TB
+    subgraph "User Configuration"
+        GWAPI_RI["HTTPRoute Rule<br/><i>sessionPersistence</i><br/><b>(NOT SUPPORTED)</b>"]
+        GCPBP["GCPBackendPolicy<br/><i>sessionAffinity:<br/>CLIENT_IP / GENERATED_COOKIE</i>"]
+        GCPTDP["GCPTrafficDistributionPolicy<br/><i>sessionAffinity:<br/>HTTP_COOKIE / HEADER_FIELD</i>"]
+        GCPSAF["GCPSessionAffinityFilter<br/><i>ExtensionRef on HTTPRoute<br/>(strong persistence / GSSA)</i>"]
+        GCPSAP["GCPSessionAffinityPolicy<br/><i>service-level GSSA<br/>(strong persistence)</i>"]
+    end
+
+    subgraph "GKE Gateway Controller (closed-source)"
+        CTRL["GKE Gateway Controller<br/><i>networking.gke.io/gateway</i>"]
+    end
+
+    subgraph "Google Cloud Load Balancer"
+        BA["Backend Service<br/><i>sessionAffinity config<br/>affinityCookieTtlSec</i>"]
+        GSSA["Stateful Session Affinity<br/><i>GSSA cookie (encoded host)</i>"]
+    end
+
+    GWAPI_RI -.->|"NOT<br/>SUPPORTED"| CTRL
+    GCPBP -->|"basic affinity"| CTRL
+    GCPTDP -->|"advanced affinity"| CTRL
+    GCPSAF -->|"strong persistence"| CTRL
+    GCPSAP -->|"strong persistence"| CTRL
+    CTRL --> BA
+    CTRL --> GSSA
+
+    classDef notimpl fill:#fff3cd,stroke:#ffc107,stroke-dasharray: 5 5
+    classDef existing fill:#d4edda,stroke:#28a745
+    classDef gcloud fill:#cce5ff,stroke:#004085
+    classDef pipeline fill:#f0f0f0,stroke:#666
+    class GWAPI_RI notimpl
+    class GCPBP,GCPTDP,GCPSAF,GCPSAP existing
+    class BA,GSSA gcloud
+    class CTRL pipeline"""
+
     if name == "Istio":
         return """graph TB
     subgraph "User Configuration"
@@ -887,6 +943,89 @@ def render_detail_diagram(impl: dict) -> str:
     class GWAPI_RI,USP existing
     class SC,IH,PP nginx
     class CP,GB,DB,CG pipeline"""
+
+    if name == "HAProxy Ingress":
+        return """graph TB
+    subgraph "User Configuration"
+        ANNOT["Service Annotations<br/><i>haproxy-ingress.github.io/<br/>affinity: cookie<br/>session-cookie-name: SERVERID<br/>session-cookie-strategy: insert</i>"]
+        GWAPI_RI["HTTPRoute Rule<br/><i>sessionPersistence</i><br/><b>(NOT IMPLEMENTED)</b>"]
+        GWAPI_BTP["BackendTrafficPolicy<br/><i>sessionPersistence</i><br/><b>(NOT IMPLEMENTED)</b>"]
+    end
+
+    subgraph "HAProxy Ingress Controller"
+        CONV["Converter<br/><i>annotations → hatypes model</i>"]
+        TMPL["Go Templates<br/><i>haproxy.tmpl</i>"]
+    end
+
+    subgraph "HAProxy Configuration"
+        subgraph "backend (per-Service)"
+            COOKIE["cookie SERVERID insert<br/><i>indirect nocache<br/>domain, httponly, secure</i>"]
+            BALANCE["balance roundrobin"]
+            SERVERS["server s1 10.0.0.1:80<br/>cookie s1"]
+        end
+    end
+
+    ANNOT -->|"annotation-driven"| CONV
+    CONV --> TMPL
+    TMPL --> COOKIE
+    TMPL --> BALANCE
+    TMPL --> SERVERS
+
+    GWAPI_RI -.->|"NOT<br/>IMPLEMENTED"| CONV
+    GWAPI_BTP -.->|"NOT<br/>IMPLEMENTED"| CONV
+
+    classDef notimpl fill:#fff3cd,stroke:#ffc107,stroke-dasharray: 5 5
+    classDef existing fill:#d4edda,stroke:#28a745
+    classDef haproxy fill:#cce5ff,stroke:#004085
+    classDef pipeline fill:#f0f0f0,stroke:#666
+    class GWAPI_RI,GWAPI_BTP notimpl
+    class ANNOT existing
+    class COOKIE,BALANCE,SERVERS haproxy
+    class CONV,TMPL pipeline"""
+
+    if name == "Cilium":
+        return """graph TB
+    subgraph "User Configuration"
+        GWAPI_RI["HTTPRoute Rule<br/><i>sessionPersistence</i><br/><b>(NOT IMPLEMENTED)</b>"]
+        CEC["CiliumEnvoyConfig<br/><i>custom Envoy listener/cluster<br/>config (advanced)</i>"]
+        GWAPI_BTP["BackendTrafficPolicy<br/><i>sessionPersistence</i><br/><b>(NOT IMPLEMENTED)</b>"]
+    end
+
+    subgraph "Cilium Agent"
+        GWAPI_PROC["Gateway API<br/>Resource Processor"]
+        XDS_SERVER["Embedded xDS Server<br/><i>CDS/LDS/RDS/EDS</i>"]
+    end
+
+    subgraph "Dataplane"
+        subgraph "eBPF (L3/L4)"
+            EBPF["Socket-level LB<br/><i>Maglev / random<br/>session affinity via<br/>ct_state / lb4_affinity_map</i>"]
+        end
+        subgraph "Envoy (L7 HTTP)"
+            ENVOY_LB["Cluster LB Policy<br/><i>(no session persistence<br/>config generated)</i>"]
+            ENVOY_ROUTE["Route Config<br/><i>(no hash_policy or<br/>stateful_session)</i>"]
+        end
+    end
+
+    GWAPI_RI -.->|"NOT<br/>IMPLEMENTED"| GWAPI_PROC
+    GWAPI_BTP -.->|"NOT<br/>IMPLEMENTED"| GWAPI_PROC
+    GWAPI_PROC --> XDS_SERVER
+    XDS_SERVER --> ENVOY_LB
+    XDS_SERVER --> ENVOY_ROUTE
+
+    CEC -->|"advanced users"| XDS_SERVER
+
+    EBPF -.->|"L3/L4 only"| ENVOY_LB
+
+    classDef notimpl fill:#fff3cd,stroke:#ffc107,stroke-dasharray: 5 5
+    classDef existing fill:#d4edda,stroke:#28a745
+    classDef envoy fill:#cce5ff,stroke:#004085
+    classDef ebpf fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef pipeline fill:#f0f0f0,stroke:#666
+    class GWAPI_RI,GWAPI_BTP notimpl
+    class CEC existing
+    class ENVOY_LB,ENVOY_ROUTE envoy
+    class EBPF ebpf
+    class GWAPI_PROC,XDS_SERVER pipeline"""
 
     if name == "Contour":
         return """graph TB
@@ -1353,6 +1492,11 @@ def render_ecosystem_page(ecosystem: dict) -> str:
     </div>"""
 
 
+TOPIC_LINKS = [
+    ("Cookie Path", "topic-cookie-path.html"),
+]
+
+
 def wrap_html(title: str, content: str, nav_links: list[tuple[str, str]],
               impl_links: list[tuple[str, str]] = None,
               dataplane_links: list[tuple[str, str]] = None) -> str:
@@ -1373,13 +1517,14 @@ def wrap_html(title: str, content: str, nav_links: list[tuple[str, str]],
 
     tech_dropdown = _build_dropdown("Implementations", impl_links)
     tech_dropdown += _build_dropdown("Dataplanes", dataplane_links)
+    tech_dropdown += _build_dropdown("Topics", TOPIC_LINKS)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title} — GEP-1619 Implementation Analysis</title>
+    <title>{title} — Gateway API Implementation Survey</title>
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
     <script>mermaid.initialize({{startOnLoad: true, theme: 'default', flowchart: {{useMaxWidth: false}}}});</script>
     <style>
@@ -1419,6 +1564,8 @@ def wrap_html(title: str, content: str, nav_links: list[tuple[str, str]],
         nav > a:hover {{ background: rgba(255,255,255,0.15); }}
         .nav-dropdown {{
             position: relative;
+            padding-bottom: 4px;
+            margin-bottom: -4px;
         }}
         .nav-dropdown-btn {{
             background: none;
@@ -1442,7 +1589,6 @@ def wrap_html(title: str, content: str, nav_links: list[tuple[str, str]],
             box-shadow: 0 8px 24px rgba(0,0,0,0.3);
             z-index: 100;
             padding: 6px 0;
-            margin-top: 4px;
         }}
         .nav-dropdown:hover .nav-dropdown-content {{ display: block; }}
         .nav-dropdown-content a {{
@@ -1815,6 +1961,74 @@ def wrap_html(title: str, content: str, nav_links: list[tuple[str, str]],
             padding: 6px 12px;
             border-top: 2px solid var(--border);
         }}
+
+        /* Topic page styles */
+        .topic-header {{
+            background: var(--section-bg);
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            border-left: 4px solid #9c27b0;
+        }}
+        .topic-links {{
+            margin-top: 12px;
+            font-size: 14px;
+        }}
+        .spec-quote {{
+            background: #f5f5f5;
+            border-left: 4px solid var(--accent);
+            padding: 16px 20px;
+            border-radius: 0 6px 6px 0;
+            margin: 16px 0;
+            font-size: 14px;
+        }}
+        .spec-quote ol {{ margin: 8px 0 8px 20px; }}
+        .spec-source {{ font-size: 12px; color: #888; margin-top: 8px; }}
+        .callout {{
+            padding: 16px 20px;
+            border-radius: 6px;
+            margin: 16px 0;
+            font-size: 14px;
+        }}
+        .callout-warning {{
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+        }}
+        .callout-info {{
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+        }}
+        .proposals-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin: 16px 0 32px;
+        }}
+        .proposal-card {{
+            border: 2px solid #28a745;
+            border-radius: 8px;
+            padding: 16px;
+            background: #f8fff8;
+        }}
+        .proposal-card.current {{
+            border-color: #ffc107;
+            background: #fffef5;
+        }}
+        .proposal-card h4 {{ margin-bottom: 8px; }}
+        .proposal-pro-con {{ margin: 12px 0; font-size: 13px; }}
+        .proposal-pro-con .pro::before {{ content: "✓ "; color: #28a745; font-weight: bold; }}
+        .proposal-pro-con .con::before {{ content: "✗ "; color: #dc3545; font-weight: bold; }}
+        .proposal-pro-con p {{ margin: 4px 0; }}
+        .impl-count {{ font-size: 12px; color: #666; margin-top: 8px; font-style: italic; }}
+        .notes-cell {{ font-size: 13px; max-width: 300px; }}
+        .topic-link {{
+            text-decoration: none;
+            font-size: 14px;
+            margin-left: 4px;
+            vertical-align: middle;
+            opacity: 0.7;
+        }}
+        .topic-link:hover {{ opacity: 1; }}
     </style>
 </head>
 <body>
@@ -1834,25 +2048,38 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
     impl_list = [i for i in impls if i["metadata"].get("type") != "dataplane_only"]
 
     # Define the canonical GEP-1619 API fields to score
+    # (canonical_key, display_name, description, topic_url or None)
     api_fields = [
-        ("type: Cookie", "type: Cookie", "Session persistence using cookies"),
-        ("type: Header", "type: Header", "Session persistence using headers"),
-        ("sessionName", "sessionName", "User-specified session name (cookie/header name)"),
-        ("absoluteTimeout", "absoluteTimeout", "Maximum session lifetime (maps to cookie TTL)"),
-        ("idleTimeout", "idleTimeout", "Session expires after inactivity period"),
-        ("cookieConfig.lifetimeType: Session", "cookie.lifetimeType: Session", "Session cookie (no expiry, cleared on browser close)"),
-        ("cookieConfig.lifetimeType: Permanent", "cookie.lifetimeType: Permanent", "Persistent cookie with expiry from absoluteTimeout"),
-        ("cookie path (computed)", "cookie path (computed)", "Cookie path derived from route path matches"),
+        ("type: Cookie", "type: Cookie", "Session persistence using cookies", None),
+        ("type: Header", "type: Header", "Session persistence using headers", None),
+        ("sessionName", "sessionName", "User-specified session name (cookie/header name)", None),
+        ("absoluteTimeout", "absoluteTimeout", "Maximum session lifetime (maps to cookie TTL)", None),
+        ("idleTimeout", "idleTimeout", "Session expires after inactivity period", None),
+        ("cookieConfig.lifetimeType: Session", "cookie.lifetimeType: Session", "Session cookie (no expiry, cleared on browser close)", None),
+        ("cookieConfig.lifetimeType: Permanent", "cookie.lifetimeType: Permanent", "Persistent cookie with expiry from absoluteTimeout", None),
+        ("cookie path (computed)", "cookie path (computed)", "Cookie path derived from route path matches", "topic-cookie-path.html"),
     ]
 
-    # Score each field across implementations
-    # Map gwapi_field values to their canonical key (handle slight naming variations)
+    # Alias map: normalize YAML gwapi_field values to canonical keys
+    field_aliases = {
+        "type: cookie": "type: Cookie",
+        "type: header": "type: Header",
+        "sessionname": "sessionName",
+        "cookie.name": "sessionName",
+        "header.name": "sessionName",
+        "absolutetimeout": "absoluteTimeout",
+        "idletimeout": "idleTimeout",
+        "cookie.lifetimetype: session": "cookieConfig.lifetimeType: Session",
+        "cookieconfig.lifetimetype: session": "cookieConfig.lifetimeType: Session",
+        "cookie.lifetimetype: permanent": "cookieConfig.lifetimeType: Permanent",
+        "cookieconfig.lifetimetype: permanent": "cookieConfig.lifetimeType: Permanent",
+        "cookie path (computed)": "cookie path (computed)",
+        "cookie path (not in spec)": "cookie path (computed)",
+        "cookie path": "cookie path (computed)",
+    }
+
     def normalize_field(f):
-        f = f.lower().strip()
-        for key, _, _ in api_fields:
-            if key.lower() in f or f in key.lower():
-                return key
-        return f
+        return field_aliases.get(f.lower().strip(), f)
 
     # Difficulty scoring: direct=3, translation_needed=2, not_supported=0, no_native_equivalent=0
     diff_scores = {"direct": 3, "translation_needed": 2, "not_supported": 0, "no_native_equivalent": 0}
@@ -1860,8 +2087,9 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
     diff_labels = {"direct": "Direct", "translation_needed": "Needs Translation", "not_supported": "Not Supported", "no_native_equivalent": "No Equivalent"}
 
     # Build per-field, per-implementation matrix
+    canonical_keys = {key for key, _, _, _ in api_fields}
     field_data = {}
-    for key, _, _ in api_fields:
+    for key, _, _, _ in api_fields:
         field_data[key] = {}
 
     for impl in impl_list:
@@ -1870,14 +2098,9 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
         for fm in ga.get("field_mapping", []):
             gwapi_field = fm.get("gwapi_field", "")
             difficulty = fm.get("mapping_difficulty", "")
-            # Match to canonical field
-            matched = None
-            for key, _, _ in api_fields:
-                if key.lower() in gwapi_field.lower() or gwapi_field.lower() in key.lower():
-                    matched = key
-                    break
-            if matched and matched in field_data:
-                field_data[matched][name] = difficulty
+            canonical = normalize_field(gwapi_field)
+            if canonical in canonical_keys:
+                field_data[canonical][name] = difficulty
 
     # Compute implementation status for both attachment points
     def compute_ap_status(ap_key):
@@ -1917,7 +2140,7 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
 
     # Per-field scores
     field_scores_html = ""
-    for key, display, desc in api_fields:
+    for key, display, desc, topic_url in api_fields:
         mappings = field_data.get(key, {})
         if not mappings:
             pct = 0
@@ -1944,10 +2167,13 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
             else:
                 dots += f'<span class="field-dot" style="background:#e0e0e0" title="{name}: not analyzed"></span>'
 
+        # Topic link
+        topic_link = f' <a href="{topic_url}" class="topic-link" title="Deep dive: {display}">&#x1f50d;</a>' if topic_url else ""
+
         field_scores_html += f"""
         <div class="field-score-row">
             <div class="field-score-label">
-                <code>{display}</code>
+                <code>{display}</code>{topic_link}
                 <span class="field-desc">{desc}</span>
             </div>
             <div class="field-score-bar-container">
@@ -1989,9 +2215,10 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
         f"<th>{impl['metadata']['name']}</th>" for impl in impl_list
     )
     matrix_rows = ""
-    for key, display, desc in api_fields:
+    for key, display, desc, topic_url in api_fields:
         mappings = field_data.get(key, {})
-        row = f"<td><code>{display}</code></td>"
+        topic = f' <a href="{topic_url}" title="Deep dive">&#x1f50d;</a>' if topic_url else ""
+        row = f"<td><code>{display}</code>{topic}</td>"
         for impl in impl_list:
             name = impl["metadata"]["name"]
             d = mappings.get(name, "")
@@ -2023,24 +2250,24 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
         attach_rows += f"<tr>{row}</tr>"
 
     # Capability matrix — split implementations and dataplanes
-    # (label, capability path, GEP-1619 field name or None)
+    # (label, capability path, GEP-1619 field name or None, topic URL or None)
     # GEP-1619 fields first, then other capabilities
     cap_fields = [
-        ("Cookie Persistence", "cookie_persistence", "type: Cookie"),
-        ("Header Persistence", "header_persistence", "type: Header"),
-        ("Session Name", "cookie_attributes.name", "sessionName"),
-        ("Absolute Timeout", "absolute_timeout", "absoluteTimeout"),
-        ("Idle Timeout", "idle_timeout", "idleTimeout"),
-        ("Cookie Lifetime: Session", "lifetime_type_session", "cookieConfig.lifetimeType: Session"),
-        ("Cookie Lifetime: Permanent", "lifetime_type_permanent", "cookieConfig.lifetimeType: Permanent"),
-        ("Cookie Path", "cookie_attributes.path", "cookie path (computed)"),
-        ("Cookie TTL", "cookie_attributes.ttl", "absoluteTimeout (cookie TTL)"),
+        ("Cookie Persistence", "cookie_persistence", "type: Cookie", None),
+        ("Header Persistence", "header_persistence", "type: Header", None),
+        ("Session Name", "cookie_attributes.name", "sessionName", None),
+        ("Absolute Timeout", "absolute_timeout", "absoluteTimeout", None),
+        ("Idle Timeout", "idle_timeout", "idleTimeout", None),
+        ("Cookie Lifetime: Session", "lifetime_type_session", "cookieConfig.lifetimeType: Session", None),
+        ("Cookie Lifetime: Permanent", "lifetime_type_permanent", "cookieConfig.lifetimeType: Permanent", None),
+        ("Cookie Path", "cookie_attributes.path", "cookie path (computed)", "topic-cookie-path.html"),
+        ("Cookie TTL", "cookie_attributes.ttl", "absoluteTimeout (cookie TTL)", None),
         # Other capabilities (not in GEP-1619)
-        ("Source IP Affinity", "source_ip_affinity", None),
-        ("Cookie Domain", "cookie_attributes.domain", None),
-        ("Cookie Secure", "cookie_attributes.secure", None),
-        ("Cookie HttpOnly", "cookie_attributes.http_only", None),
-        ("Cookie SameSite", "cookie_attributes.same_site", None),
+        ("Source IP Affinity", "source_ip_affinity", None, None),
+        ("Cookie Domain", "cookie_attributes.domain", None, None),
+        ("Cookie Secure", "cookie_attributes.secure", None, None),
+        ("Cookie HttpOnly", "cookie_attributes.http_only", None, None),
+        ("Cookie SameSite", "cookie_attributes.same_site", None, None),
     ]
     dp_list = [i for i in impls if i["metadata"].get("type") == "dataplane_only"]
     n_impls = len(impl_list)
@@ -2062,13 +2289,14 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
     cap_ordered = list(impl_list) + list(dp_list)
     cap_rows = ""
     prev_had_field = True  # track group transitions
-    for label, path, gwapi_field in cap_fields:
+    for label, path, gwapi_field, cap_topic_url in cap_fields:
         # Insert separator row when transitioning from GEP-1619 fields to other capabilities
         if prev_had_field and gwapi_field is None:
             cap_rows += f'<tr class="cap-group-separator"><td colspan="{n_data_cols + 2}"><em>Additional Native Capabilities (not in GEP-1619)</em></td></tr>'
         prev_had_field = gwapi_field is not None
 
-        field_cell = f"<td><code>{gwapi_field}</code></td>" if gwapi_field else "<td></td>"
+        cap_topic = f' <a href="{cap_topic_url}" class="topic-link" title="Deep dive">&#x1f50d;</a>' if cap_topic_url else ""
+        field_cell = f"<td><code>{gwapi_field}</code>{cap_topic}</td>" if gwapi_field else "<td></td>"
         row = f"<td>{label}</td>{field_cell}"
         for impl in cap_ordered:
             is_dp = impl["metadata"].get("type") == "dataplane_only"
@@ -2161,6 +2389,290 @@ def render_api_support_page(impls: list[dict], ecosystem: dict) -> str:
     </div>"""
 
 
+def render_cookie_path_page(impls: list[dict]) -> str:
+    """Render a deep-dive topic page on cookie path handling across implementations."""
+    impl_list = [i for i in impls if i["metadata"].get("type") != "dataplane_only"]
+    dp_list = [i for i in impls if i["metadata"].get("type") == "dataplane_only"]
+
+    # Extract cookie path info from field_mapping for each implementation
+    path_data = {}
+    for impl in impl_list:
+        name = impl["metadata"]["name"]
+        ga = impl.get("gwapi_assessment", {})
+        for fm in ga.get("field_mapping", []):
+            gf = fm.get("gwapi_field", "").lower()
+            if "cookie path" in gf:
+                path_data[name] = {
+                    "native_field": fm.get("native_field", "—"),
+                    "difficulty": fm.get("mapping_difficulty", ""),
+                    "notes": fm.get("notes", ""),
+                }
+                break
+        if name not in path_data:
+            path_data[name] = {"native_field": "—", "difficulty": "", "notes": ""}
+
+    # Build comparison table rows
+    comp_rows = ""
+    for impl in impl_list:
+        name = impl["metadata"]["name"]
+        repo_url = impl["metadata"].get("repo_url", "")
+        d = path_data.get(name, {})
+        diff = d.get("difficulty", "")
+        badge = mapping_badge(diff) if diff else "—"
+        native = d.get("native_field", "—") or "—"
+        notes = inline_code(d.get("notes", "").strip().replace("\n", " "))
+
+        # Determine behavior
+        caps = impl.get("native_profile", {}).get("capabilities", {})
+        cookie_attrs = caps.get("cookie_attributes", {})
+        has_path = cookie_attrs.get("path", False)
+
+        if diff == "direct":
+            behavior = '<span style="color:#28a745;font-weight:600">Computes from route</span>'
+        elif diff == "translation_needed":
+            behavior = '<span style="color:#ffc107;font-weight:600">Needs translation</span>'
+        elif diff == "not_supported":
+            behavior = '<span style="color:#dc3545;font-weight:600">Not set / hardcoded</span>'
+        elif diff == "no_native_equivalent":
+            behavior = '<span style="color:#6c757d;font-weight:600">No equivalent</span>'
+        else:
+            behavior = '<span style="color:#6c757d">N/A</span>'
+
+        comp_rows += f"""<tr>
+            <td><a href="{impl['_filename']}.html"><strong>{name}</strong></a></td>
+            <td>{behavior}</td>
+            <td>{badge}</td>
+            <td><code>{native}</code></td>
+            <td class="notes-cell">{notes}</td>
+        </tr>"""
+
+    # Dataplane path support
+    dp_rows = ""
+    for impl in dp_list:
+        name = impl["metadata"]["name"]
+        caps = impl.get("native_profile", {}).get("capabilities", {})
+        cookie_attrs = caps.get("cookie_attributes", {})
+        has_path = cookie_attrs.get("path", False)
+        dp_rows += f"""<tr>
+            <td><a href="{impl['_filename']}.html"><strong>{name}</strong></a></td>
+            <td>{bool_icon(has_path)}</td>
+        </tr>"""
+
+    # Mermaid diagram showing the problem
+    problem_diagram = """graph LR
+    CLIENT["Client browser<br/><i>requests /</i>"] -->|"GET /"| EDGE["Edge Proxy<br/><i>rewrites to /foo/bar</i>"]
+    EDGE -->|"GET /foo/bar"| GW["Gateway API<br/><i>matches /foo/bar</i>"]
+    GW -->|"Set-Cookie:<br/>Path=/foo/bar"| CLIENT
+
+    CLIENT2["Client browser<br/><i>next request to /</i>"] -.->|"Cookie NOT sent<br/>(path mismatch)"| EDGE2["Edge Proxy"]
+
+    classDef client fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef proxy fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef gw fill:#fce4ec,stroke:#e91e63,stroke-width:2px
+    classDef broken fill:#ffebee,stroke:#c62828,stroke-width:2px,stroke-dasharray: 5 5
+    class CLIENT,CLIENT2 client
+    class EDGE,EDGE2 proxy
+    class GW gw"""
+
+    # Proposals comparison
+    proposals_diagram = """graph TB
+    subgraph STATUS_QUO["Status Quo (current GEP-1619)"]
+        SQ["Always derive Path<br/>from route match<br/><i>Path=/foo/bar</i>"]
+    end
+
+    subgraph OPTION_A["Option A: Relax (issue #4713)"]
+        OA["Allow omitting Path<br/><i>browser computes<br/>default from request URL</i>"]
+    end
+
+    subgraph OPTION_B["Option B: Explicit field"]
+        OB["Add cookieConfig.path<br/><i>operator sets exact path<br/>e.g. path: /</i>"]
+    end
+
+    SQ -.->|"breaks with<br/>upstream rewrites"| PROBLEM["Session persistence<br/>broken"]
+    OA -->|"browser defaults<br/>to request path"| WORKS["Session persistence<br/>works"]
+    OB -->|"operator controls<br/>exact scope"| WORKS
+
+    classDef current fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+    classDef proposal fill:#d4edda,stroke:#28a745,stroke-width:2px
+    classDef broken fill:#f8d7da,stroke:#dc3545,stroke-width:2px
+    classDef works fill:#d4edda,stroke:#28a745,stroke-width:2px
+    class SQ current
+    class OA,OB proposal
+    class PROBLEM broken
+    class WORKS works"""
+
+    return f"""
+    <div class="content-wrapper">
+        <div class="topic-header">
+            <h2>Cookie Path: The Scope Problem</h2>
+            <p>How should the cookie <code>Path</code> attribute be set for session persistence?
+               This is one of the most contentious aspects of GEP-1619, with active discussion
+               on whether implementations should compute it, omit it, or let operators configure it.</p>
+            <div class="topic-links">
+                <strong>Related:</strong>
+                <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4713" target="_blank">issue #4713</a> —
+                <a href="https://github.com/kubernetes-sigs/gateway-api/pull/4649" target="_blank">PR #4649</a> —
+                <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4268" target="_blank">issue #4268</a> —
+                <a href="https://gateway-api.sigs.k8s.io/geps/gep-1619/#path" target="_blank">GEP-1619 Path section</a>
+            </div>
+        </div>
+
+        <h3>What the Spec Says Today</h3>
+        <div class="spec-quote">
+            <p>When session persistence is enabled on an xRoute rule, the implementor should interpret the path
+               as configured on the xRoute:</p>
+            <ol>
+                <li>For a route that matches all paths, set <code>Path=/</code></li>
+                <li>For multiple paths, use the matched route path</li>
+                <li>For regex paths, use the longest non-regex prefix</li>
+            </ol>
+            <p>When attached via <code>BackendLBPolicy</code> to a Service, the <code>Path</code> attribute
+               <strong>MUST be left unset</strong>.</p>
+            <p class="spec-source">— <a href="https://gateway-api.sigs.k8s.io/geps/gep-1619/#path" target="_blank">GEP-1619, Path section</a></p>
+        </div>
+
+        <h3>The Problem</h3>
+        <p>The current guidance breaks when the path seen by the Gateway API implementation differs from the
+           path the client browser requested — e.g. when an upstream edge proxy rewrites the URL.</p>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{problem_diagram}</pre>
+    </div>
+    <div class="content-wrapper">
+        <div class="callout callout-warning">
+            <strong>Result:</strong> The browser scopes the cookie to <code>/foo/bar</code>, but the user's
+            next request goes to <code>/</code>. The browser doesn't send the cookie, and session persistence breaks.
+        </div>
+
+        <h3>Why Cookie Path Scoping Matters</h3>
+        <p>Beyond the rewrite problem, there's a practical reason to care about cookie path scope:
+           <strong>cookie proliferation and bandwidth overhead.</strong></p>
+        <div class="callout callout-info">
+            <p>A cookie scoped to <code>Path=/</code> is sent with <strong>every request</strong> to the domain —
+               API calls, static assets, images, websockets, everything. In a setup with multiple backends:</p>
+            <pre style="background:#f5f5f5;padding:12px;border-radius:4px;font-size:13px;margin:8px 0">/app    → backend_app    (cookie APP_SRV)
+/api    → backend_api    (cookie API_SRV)
+/static → backend_static (cookie STATIC_SRV)</pre>
+            <p>Every request to <code>/static/logo.png</code> sends all three cookies, even though only
+               <code>STATIC_SRV</code> is relevant. With enough backends, this adds hundreds of bytes to every request.</p>
+            <p>Scoping each cookie to its route path (<code>Path=/app</code>, <code>Path=/api</code>, etc.) avoids
+               this overhead and follows the principle of least privilege. This is a real complaint in the
+               <a href="https://discourse.haproxy.org/t/preventing-proliferation-of-sticky-session-cookies-with-multiple-backends/8924" target="_blank">HAProxy community</a>,
+               where the cookie path is hardcoded to <code>/</code> with no way to change it.</p>
+        </div>
+
+        <h3>How Implementations Handle It Today</h3>
+        <table class="comparison-table">
+            <thead><tr>
+                <th>Implementation</th>
+                <th>Cookie Path Behavior</th>
+                <th>Mapping</th>
+                <th>Native Mechanism</th>
+                <th>Notes</th>
+            </tr></thead>
+            <tbody>{comp_rows}</tbody>
+        </table>
+
+        <h4>Dataplane Path Support</h4>
+        <p>Whether the underlying dataplane even supports configuring cookie path:</p>
+        <table class="comparison-table" style="max-width:400px">
+            <thead><tr><th>Dataplane</th><th>Cookie Path Configurable</th></tr></thead>
+            <tbody>{dp_rows}</tbody>
+        </table>
+
+        <h3>The Proposals</h3>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{proposals_diagram}</pre>
+    </div>
+    <div class="content-wrapper">
+        <div class="proposals-grid">
+            <div class="proposal-card current">
+                <h4>Status Quo</h4>
+                <p><strong>Always compute from route match</strong></p>
+                <p>Implementations SHOULD derive <code>Path</code> from the matched xRoute path.
+                   Works well when the client URL matches what the gateway sees.</p>
+                <div class="proposal-pro-con">
+                    <p class="pro">Deterministic — no ambiguity about cookie scope</p>
+                    <p class="pro">Avoids cookie proliferation — each cookie only sent for its route's path</p>
+                    <p class="pro">Least privilege — cookie not exposed to unrelated routes</p>
+                    <p class="con">Breaks with upstream rewrites, edge proxies, CDNs</p>
+                    <p class="con">Browsers won't send cookie if paths don't match</p>
+                </div>
+                <p class="impl-count">{sum(1 for d in path_data.values() if d['difficulty'] == 'direct')}/{len(impl_list)} implementations compute path</p>
+            </div>
+            <div class="proposal-card">
+                <h4>Option A: Relax to Allow Omitting</h4>
+                <p><strong>Let implementations leave Path unset</strong></p>
+                <p>When <code>Path</code> is omitted from <code>Set-Cookie</code>, the browser computes
+                   the default path from the URL the user actually requested — not the internally rewritten URL.</p>
+                <div class="proposal-pro-con">
+                    <p class="pro">Fixes the upstream rewrite problem</p>
+                    <p class="pro">Simple — just don't set the attribute</p>
+                    <p class="con">Less predictable — browser behavior varies</p>
+                    <p class="con">Cookie scope may be broader than intended</p>
+                    <p class="con">Cookie proliferation — all cookies sent with all requests</p>
+                </div>
+                <p class="impl-count">{sum(1 for d in path_data.values() if d['difficulty'] in ('not_supported', 'no_native_equivalent'))}/{len(impl_list)} implementations already omit path</p>
+            </div>
+            <div class="proposal-card">
+                <h4>Option B: Add Explicit <code>cookieConfig.path</code></h4>
+                <p><strong>Let operators configure the exact path</strong></p>
+                <p>Add a <code>path</code> field to <code>cookieConfig</code> so operators can explicitly
+                   set the cookie scope. This gives full control without relying on computed or browser-default behavior.</p>
+                <div class="proposal-pro-con">
+                    <p class="pro">Full operator control</p>
+                    <p class="pro">Portable — same behavior everywhere</p>
+                    <p class="pro">Can be combined with Option A as the default</p>
+                    <p class="con">More API surface to maintain</p>
+                    <p class="con">Security consideration: could scope cookie broader than the route</p>
+                </div>
+                <p class="impl-count">Proposed in <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4713" target="_blank">issue #4713</a></p>
+            </div>
+        </div>
+
+        <h3>Security Considerations</h3>
+        <div class="callout callout-info">
+            <p>A <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4713#issuecomment-2813977919" target="_blank">maintainer comment on #4713</a> raised that an explicit or unset path
+               could set a cookie with <em>broader scope</em> than the HTTPRoute, potentially affecting requests
+               arriving through other routes in other namespaces. For <code>BackendLBPolicy</code>, explicit path
+               is safer because the policy is co-located with the Service.</p>
+        </div>
+
+        <h3>Related Issues</h3>
+        <table class="comparison-table">
+            <thead><tr><th>Issue</th><th>Title</th><th>Relevance</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td><a href="https://github.com/kubernetes-sigs/gateway-api/issues/4713" target="_blank">#4713</a></td>
+                    <td>Relax route-level cookie Path handling and consider explicit Path configuration</td>
+                    <td>Primary issue — proposes both relaxing and adding explicit path</td>
+                </tr>
+                <tr>
+                    <td><a href="https://github.com/kubernetes-sigs/gateway-api/pull/4649" target="_blank">PR #4649</a></td>
+                    <td>Session Name Refactoring and Behavior Clarification</td>
+                    <td>WIP PR addressing session name scoping — related path considerations</td>
+                </tr>
+                <tr>
+                    <td><a href="https://github.com/kubernetes-sigs/gateway-api/issues/4268" target="_blank">#4268</a></td>
+                    <td>Clarify sessionPersistence scoping and conflict resolution</td>
+                    <td>Session name uniqueness across routes — cookie path scope is a factor</td>
+                </tr>
+                <tr>
+                    <td><a href="https://github.com/kubernetes-sigs/gateway-api/issues/4385" target="_blank">#4385</a></td>
+                    <td>SessionPersistence based on URL</td>
+                    <td>URL-based persistence — different use case but related to path handling</td>
+                </tr>
+                <tr>
+                    <td><a href="https://github.com/kubernetes-sigs/gateway-api/issues/4258" target="_blank">#4258</a></td>
+                    <td>STD: Session Persistence (GEP 1619) — standardization tracking</td>
+                    <td>Standardization umbrella — cookie path semantics must be resolved before Standard</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>"""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate implementation analysis site")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
@@ -2210,6 +2722,11 @@ def main():
     api_support_content = render_api_support_page(impls, ecosystem)
     (args.output_dir / "api-support.html").write_text(gen_html("API Support", api_support_content))
     print(f"Generated: api-support.html")
+
+    # Generate topic pages
+    cookie_path_content = render_cookie_path_page(impls)
+    (args.output_dir / "topic-cookie-path.html").write_text(gen_html("Cookie Path", cookie_path_content))
+    print(f"Generated: topic-cookie-path.html")
 
     # Generate per-implementation pages
     for impl in impls:

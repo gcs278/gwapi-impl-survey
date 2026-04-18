@@ -1,0 +1,638 @@
+metadata:
+  name: HAProxy
+  type: dataplane_only
+  dataplane: self
+  version_analyzed: "3.2.x LTS / 3.3.x stable (latest as of April 2026)"
+  repo_url: https://github.com/haproxy/haproxy
+  docs_url: https://docs.haproxy.org/3.2/configuration.html
+  last_updated: 2026-04-17
+
+# Dataplane reports don't have a translation model — they ARE the target.
+# Instead we document what APIs controllers must program.
+api_stack:
+  translation_model: direct
+  layers:
+    - name: HAProxy Configuration
+      type: dataplane
+      resources:
+        - "`cookie` directive (insert, rewrite, prefix modes)"
+        - "`stick-table` + `stick on` / `stick match` / `stick store-request` / `stick store-response`"
+        - "`balance` algorithms (source, uri, url_param, hdr, rdp-cookie)"
+        - "Server `cookie` parameter (per-server cookie value)"
+      description: |
+        HAProxy's session persistence is configured via its native configuration file
+        (`haproxy.cfg`). Controllers generate this config to program HAProxy's session
+        persistence behavior. There is no intermediate API — the config file IS the API.
+
+native_profile:
+  overview: |
+    HAProxy provides two fundamentally different session persistence mechanisms: **cookie-based
+    persistence** via the `cookie` directive, and **stick-table persistence** via `stick-table`,
+    `stick on`, `stick match`, and `stick store-*` directives. Additionally, several `balance`
+    algorithms (source, uri, url_param, hdr, rdp-cookie) provide hash-based session affinity.
+
+    **Cookie-based persistence** (`cookie` directive) is the most common approach. HAProxy can
+    operate in three mutually exclusive cookie modes: `insert` (HAProxy creates its own cookie),
+    `rewrite` (HAProxy overwrites an existing application cookie value), and `prefix` (HAProxy
+    prepends a server identifier to an existing application cookie value, separated by `~`).
+    The `insert` mode with `indirect nocache` is the most widely recommended configuration.
+
+    **Stick-table persistence** uses an in-memory key-value store to track client-to-server
+    associations. The key can be a source IP (`type ip`), a cookie value (`req.cook()`), a
+    header value (`req.hdr()`), a URL parameter, or any other fetch method. Stick tables
+    support peer replication for multi-node deployments and configurable expiry. Up to 8 keys
+    may be tracked in parallel per backend.
+
+    **Hash-based balance algorithms** (`balance source`, `balance uri`, `balance url_param`,
+    `balance hdr()`, `balance rdp-cookie`) provide deterministic routing based on hashing
+    a request property. These are soft affinity — adding/removing servers redistributes
+    affected sessions. The `hash-type consistent` modifier reduces disruption to ~1/N sessions
+    on membership changes (consistent hashing).
+
+    Cookie persistence and stick-table persistence are distinct features that can be used
+    independently or combined. Cookie persistence is purely client-side (the cookie carries the
+    server identity), while stick-table persistence is server-side (HAProxy maintains a table
+    mapping keys to servers). Hash-based algorithms require no state storage at all.
+
+  mechanisms:
+    - name: Cookie Persistence
+      type: strong_persistence
+      description: |
+        The `cookie` directive in a `backend` section enables cookie-based session persistence.
+        HAProxy associates each server with a cookie value (set via the `server` line's `cookie`
+        parameter or auto-generated with `dynamic`). Three mutually exclusive modes control how
+        the cookie is managed:
+
+        **`insert` mode**: HAProxy inserts its own `Set-Cookie` header into the first response
+        to a client that does not already have a valid persistence cookie. The cookie value is
+        the server's assigned cookie identifier. On subsequent requests, HAProxy reads this
+        cookie and routes to the matching server. With `indirect`, HAProxy strips the cookie
+        from requests forwarded to the backend (the application never sees it). With `nocache`,
+        HAProxy adds `Cache-Control: private` to prevent intermediate caches from storing the
+        response containing the `Set-Cookie`. With `preserve`, if the server itself emits a
+        cookie with the same name, HAProxy leaves it untouched instead of replacing it. This
+        is the most commonly recommended mode: `cookie SERVERID insert indirect nocache`.
+
+        **`rewrite` mode**: HAProxy rewrites the value of an existing application cookie (set
+        by the backend server) to contain the server identifier. The cookie must already exist
+        in the server's response — HAProxy does not create it. On subsequent requests, HAProxy
+        reads the rewritten value to determine the target server, then rewrites it back to the
+        original value before forwarding to the backend. This mode is NOT recommended for new
+        deployments because it requires monitoring all responses and does not work in HTTP
+        tunnel mode.
+
+        **`prefix` mode**: HAProxy prepends the server identifier followed by a `~` delimiter
+        to an existing application cookie value. For example, if the server sets
+        `JSESSIONID=abc123`, HAProxy modifies it to `JSESSIONID=s1~abc123`. On subsequent
+        requests, HAProxy extracts and strips the prefix before forwarding to the backend.
+        This mode piggybacks on the application's existing cookie, avoiding an additional
+        cookie. However, `prefix` mode may strip existing cookie attributes like `Secure`,
+        `HttpOnly`, and `SameSite` — they must be re-added explicitly.
+
+        Cookie persistence survives server additions/removals without remapping existing
+        clients (unlike hash-based algorithms), because the cookie directly identifies the
+        target server. If the target server is unavailable, `option redispatch` allows
+        re-routing to another server.
+      enabled_by_default: false
+      configuration_method: "`cookie` directive in `backend` section of `haproxy.cfg`"
+
+      config_options:
+        - field: "cookie <name>"
+          type: string
+          required: true
+          default: null
+          description: "The cookie name used for persistence. This is the first argument to the `cookie` directive."
+          support_level: full
+        - field: "insert"
+          type: keyword
+          required: false
+          default: null
+          description: "HAProxy inserts a new `Set-Cookie` header with the server identifier. Incompatible with `rewrite` and `prefix`."
+          support_level: full
+        - field: "rewrite"
+          type: keyword
+          required: false
+          default: null
+          description: "HAProxy rewrites the value of an existing application cookie. Incompatible with `insert` and `prefix`. Not recommended for new deployments."
+          support_level: full
+        - field: "prefix"
+          type: keyword
+          required: false
+          default: null
+          description: "HAProxy prepends the server identifier and `~` to an existing application cookie value. Incompatible with `insert` and `rewrite`."
+          support_level: full
+        - field: "indirect"
+          type: keyword
+          required: false
+          default: null
+          description: "No cookie emitted to clients that already have a valid one. In `insert` mode, also strips the cookie from requests forwarded to the backend, making persistence transparent to the application."
+          support_level: full
+        - field: "nocache"
+          type: keyword
+          required: false
+          default: null
+          description: "Adds `Cache-Control: private` to responses where a cookie is inserted, preventing intermediate caches from storing them. Recommended with `insert` mode."
+          support_level: full
+        - field: "postonly"
+          type: keyword
+          required: false
+          default: null
+          description: "Limits cookie insertion to POST responses only. Useful when the first request is always a POST (e.g., login form)."
+          support_level: full
+        - field: "preserve"
+          type: keyword
+          required: false
+          default: null
+          description: "Only usable with `insert` and/or `indirect`. If the server itself emits a cookie with the same name, HAProxy leaves it untouched instead of overwriting."
+          support_level: full
+        - field: "httponly"
+          type: keyword
+          required: false
+          default: null
+          description: "Adds the `HttpOnly` attribute to inserted cookies, preventing JavaScript access (XSS mitigation). Per RFC 6265."
+          support_level: full
+        - field: "secure"
+          type: keyword
+          required: false
+          default: null
+          description: "Adds the `Secure` attribute to inserted cookies, so the browser only sends them over HTTPS. Essential when HAProxy performs SSL termination."
+          support_level: full
+        - field: "domain <domain>"
+          type: "string (repeatable)"
+          required: false
+          default: null
+          description: "Sets the `Domain` attribute on inserted cookies. Can be specified multiple times for multiple domains."
+          support_level: full
+        - field: "maxidle <idle>"
+          type: "duration (seconds)"
+          required: false
+          default: null
+          description: "Maximum idle time. If the cookie is not presented within this interval, it is ignored. Only works with `insert` mode. The idle timer is refreshed on each request."
+          support_level: full
+        - field: "maxlife <life>"
+          type: "duration (seconds)"
+          required: false
+          default: null
+          description: "Maximum lifetime. The cookie is ignored after this time regardless of activity. Only works with `insert` mode. The timer starts when the cookie is first created and is never refreshed. Cookies with a date more than 24 hours in the future are also ignored (timezone safety). Both `maxidle` and `maxlife` can be used together."
+          support_level: full
+        - field: "dynamic"
+          type: keyword
+          required: false
+          default: null
+          description: "Enables dynamic cookie generation. Instead of hardcoded per-server cookie values, HAProxy auto-generates values by hashing the server IP, port, and a secret key (set via `dynamic-cookie-key`). This ensures consistent cookie values across multiple load balancer instances and survives server IP changes."
+          support_level: full
+        - field: "dynamic-cookie-key <string>"
+          type: string
+          required: false
+          default: null
+          description: "Sets the secret key used for `dynamic` cookie generation. Configured as a separate directive in the backend, not as a parameter to `cookie`. The generated value is a hash of server IP + port + this key."
+          support_level: full
+        - field: "attr <value>"
+          type: "string (repeatable)"
+          required: false
+          default: null
+          description: "Adds arbitrary cookie attributes. Can be repeated. Example: `attr \"SameSite=None\"`. This is the generic escape hatch for attributes that don't have dedicated keywords."
+          support_level: full
+        - field: "server ... cookie <value>"
+          type: string
+          required: false
+          default: null
+          description: "Per-server cookie value set on the `server` line. This is the identifier HAProxy inserts into cookies to identify this backend server. Example: `server s1 10.0.0.1:80 check cookie s1`. Not needed when using `dynamic`."
+          support_level: full
+
+      attachment_model:
+        attaches_to: "Backend"
+        resource_type: "`backend` section in `haproxy.cfg`"
+        scope: "Per-backend. All servers within the backend share the same cookie configuration. Individual server cookie values are set per-server via the `server` line's `cookie` parameter."
+
+    - name: Stick-Table Persistence
+      type: strong_persistence
+      description: |
+        Stick tables provide server-side session persistence using an in-memory key-value store.
+        HAProxy tracks client-to-server associations using configurable keys extracted from
+        requests or responses. Unlike cookie persistence (where the cookie carries the server
+        identity), stick tables are stateful — HAProxy itself maintains the mapping.
+
+        A stick table is defined with `stick-table type <type> size <size> expire <time>`.
+        The table type determines the key format:
+        - `type ip` — IPv4 address keys (commonly used with `stick on src` for source IP persistence)
+        - `type ipv6` — IPv6 address keys
+        - `type string len <n>` — String keys up to `n` bytes (used with cookies, headers, URL params)
+        - `type binary len <n>` — Binary keys (used for hashes)
+        - `type integer` — Integer keys
+
+        Four directives control how stick tables are populated and queried:
+
+        **`stick on <pattern>`**: Combined lookup + store. On each request, looks up the key in
+        the table; if found, routes to the associated server. If not found (new session),
+        stores the key → server mapping after load balancing. This is the simplest approach.
+        Example: `stick on src` (source IP), `stick on req.cook(JSESSIONID)` (cookie value).
+
+        **`stick match <pattern>`**: Lookup only. Searches the table for a matching key on
+        incoming requests. If found, routes to the associated server. Does NOT store new entries.
+        Used with `stick store-response` for the common pattern of looking up on request and
+        storing from response.
+
+        **`stick store-response <pattern>`**: Stores a key extracted from the server's response.
+        Commonly used with `stick match` to capture application-generated session cookies:
+        `stick match req.cook(JSESSIONID)` + `stick store-response res.cook(JSESSIONID)`.
+
+        **`stick store-request <pattern>`**: Stores a key extracted from the request. Must be
+        declared AFTER `stick match` in the config to avoid race conditions where a new entry
+        overwrites the lookup result.
+
+        Stick tables support peer replication for multi-node HA deployments. Table contents are
+        replicated in active-active mode to other HAProxy nodes via the `peers` mechanism, and
+        to the new process during a graceful reload. Up to 8 keys may be tracked in parallel
+        per backend. Each backend can have only one stick table.
+      enabled_by_default: false
+      configuration_method: "`stick-table`, `stick on`/`stick match`/`stick store-*` directives in `backend` section"
+
+      config_options:
+        - field: "stick-table type"
+          type: "enum (ip, ipv6, string, binary, integer)"
+          required: true
+          default: null
+          description: "Key type for the stick table. Determines what kind of data is stored as keys."
+          support_level: full
+        - field: "stick-table size"
+          type: "integer (with suffix: k, m)"
+          required: true
+          default: null
+          description: "Maximum number of entries in the table. Example: `100k`, `1m`."
+          support_level: full
+        - field: "stick-table expire"
+          type: duration
+          required: false
+          default: null
+          description: "Time since a record was last matched, created, or refreshed before it is removed. Example: `30m`, `1h`."
+          support_level: full
+        - field: "stick-table len"
+          type: integer
+          required: false
+          default: null
+          description: "Maximum key length for `type string` or `type binary`. Example: `len 64`."
+          support_level: full
+        - field: "stick-table store"
+          type: "string (comma-separated list)"
+          required: false
+          default: null
+          description: "Data types to store per entry (e.g., `conn_cnt`, `http_req_rate(10s)`, `gpc0`). Primarily used for rate limiting and abuse detection, not session persistence."
+          support_level: full
+        - field: "stick-table peers"
+          type: string
+          required: false
+          default: null
+          description: "Name of the `peers` section for table replication to other HAProxy nodes. Enables active-active stick table synchronization."
+          support_level: full
+        - field: "stick on <pattern> [table <name>] [if|unless <condition>]"
+          type: "fetch method"
+          required: false
+          default: null
+          description: "Combined lookup + store. Commonly: `stick on src` (source IP), `stick on req.cook(JSESSIONID)` (cookie), `stick on req.hdr(X-Tenant-ID)` (header). The optional `table` parameter references a stick table defined in another backend."
+          support_level: full
+        - field: "stick match <pattern> [table <name>] [if|unless <condition>]"
+          type: "fetch method"
+          required: false
+          default: null
+          description: "Lookup only. Searches the table for a key on incoming requests. Used with `stick store-response` for the look-up-on-request / store-from-response pattern."
+          support_level: full
+        - field: "stick store-response <pattern> [table <name>] [if|unless <condition>]"
+          type: "fetch method"
+          required: false
+          default: null
+          description: "Stores a key extracted from the server's response. Example: `stick store-response res.cook(JSESSIONID)` to capture application-generated session cookies."
+          support_level: full
+        - field: "stick store-request <pattern> [table <name>] [if|unless <condition>]"
+          type: "fetch method"
+          required: false
+          default: null
+          description: "Stores a key extracted from the request. Must be declared AFTER `stick match` to avoid race conditions."
+          support_level: full
+
+      attachment_model:
+        attaches_to: "Backend (or Frontend for shared tables)"
+        resource_type: "`backend` or `frontend` section in `haproxy.cfg`"
+        scope: "Per-backend. Each backend can have one stick table. Tables can be shared across backends using the `table <name>` parameter on `stick` directives. Tables can also be defined in dedicated backends used solely as table holders."
+
+    - name: Hash-Based Balance Algorithms
+      type: soft_affinity
+      description: |
+        HAProxy's hash-based `balance` algorithms provide deterministic routing based on
+        hashing a request property. These are soft affinity — the same input always maps
+        to the same server, but adding/removing servers redistributes affected sessions.
+
+        **`balance source`**: Hashes the client's source IP address. Simple but affected by
+        NAT (many clients behind the same IP go to the same server). The hash is divided
+        by the total weight of running servers.
+
+        **`balance uri`**: Hashes part or all of the request URI. Useful for maximizing cache
+        hit rates (each server caches a specific set of URLs). The `whole` modifier includes
+        the query string; `len` and `depth` modifiers limit what is hashed.
+
+        **`balance url_param <name>`**: Hashes a specific URL query parameter (e.g., `userid`).
+        The `check_post` modifier also searches POST request bodies. Falls back to round-robin
+        if the parameter is absent.
+
+        **`balance hdr(<name>)`**: Hashes a specific HTTP header value. Falls back to
+        round-robin if the header is absent. The `use_domain_only` modifier extracts only
+        the main domain from `Host` headers.
+
+        **`balance rdp-cookie [<name>]`**: Hashes an RDP (Remote Desktop Protocol) cookie.
+        Defaults to `mstshash`. Used for RDP session persistence in TCP mode.
+
+        All hash-based algorithms support `hash-type consistent` to use consistent hashing,
+        which limits disruption to ~1/N sessions when servers are added or removed (instead
+        of rehashing all sessions). Without `consistent`, the default is `map-based` which
+        redistributes all sessions on any membership change.
+      enabled_by_default: false
+      configuration_method: "`balance` directive in `backend` section of `haproxy.cfg`"
+
+      config_options:
+        - field: "balance source"
+          type: keyword
+          required: false
+          default: null
+          description: "Hash on client source IP. Affected by NAT — multiple clients behind the same IP are treated as one."
+          support_level: full
+        - field: "balance uri [whole] [len <n>] [depth <n>]"
+          type: keyword
+          required: false
+          default: null
+          description: "Hash on request URI. `whole` includes query string. `len` limits characters. `depth` limits directory depth."
+          support_level: full
+        - field: "balance url_param <name> [check_post [<max_wait>]]"
+          type: keyword
+          required: false
+          default: null
+          description: "Hash on a URL query parameter. `check_post` also searches POST bodies. Falls back to round-robin if absent."
+          support_level: full
+        - field: "balance hdr(<name>) [use_domain_only]"
+          type: keyword
+          required: false
+          default: null
+          description: "Hash on an HTTP header value. Header name is case-insensitive. `use_domain_only` extracts main domain from `Host`. Falls back to round-robin if absent."
+          support_level: full
+        - field: "balance rdp-cookie [<name>]"
+          type: keyword
+          required: false
+          default: null
+          description: "Hash on an RDP cookie. Defaults to `mstshash`. Used for RDP session persistence in TCP mode."
+          support_level: full
+        - field: "hash-type <method> [<function>] [<modifier>]"
+          type: "enum (map-based, consistent)"
+          required: false
+          default: "map-based"
+          description: "Hash algorithm type. `consistent` uses consistent hashing (only ~1/N sessions break on membership change). `map-based` (default) redistributes all sessions. Hash functions: `sdbm` (default), `djb2`, `wt6`, `crc32`."
+          support_level: full
+
+      attachment_model:
+        attaches_to: "Backend"
+        resource_type: "`backend` section in `haproxy.cfg`"
+        scope: "Per-backend. The balance algorithm is set once per backend and affects all traffic to that backend. Only one balance algorithm per backend."
+
+  attachment_points:
+    - mechanism: Cookie Persistence
+      layer: backend_service
+      native_resource: "`cookie` directive in `backend` section"
+      description: |
+        The `cookie` directive is configured per-backend. It defines the cookie name, mode
+        (`insert`/`rewrite`/`prefix`), and attributes (`httponly`, `secure`, `domain`,
+        `maxidle`, `maxlife`, `dynamic`, `attr`). Each `server` line within the backend
+        specifies the cookie value that identifies that server. All routes/ACLs that select
+        this backend share the same cookie persistence configuration.
+    - mechanism: Stick-Table Persistence
+      layer: backend_service
+      native_resource: "`stick-table` + `stick on`/`stick match`/`stick store-*` in `backend` section"
+      description: |
+        Stick tables are defined per-backend (or in dedicated table-holding backends).
+        The `stick on`/`stick match`/`stick store-*` directives within the backend control
+        how keys are extracted and looked up. Stick tables operate at the backend level —
+        all frontend ACLs routing to this backend share the same stick table.
+    - mechanism: Hash-Based Balance Algorithms
+      layer: backend_service
+      native_resource: "`balance` directive in `backend` section"
+      description: |
+        The `balance` algorithm is set once per backend. It determines how requests without
+        an existing persistence association are distributed. Hash-based algorithms also
+        provide soft affinity for all traffic to the backend.
+
+  # Ingress model mapping: how HAProxy's config model maps to the standard
+  # Client -> Gateway -> Route Rule -> Backend/Service -> Endpoint model
+  ingress_model_mapping:
+    client:
+      haproxy_concept: "Downstream connection (client)"
+      description: "The client connecting to HAProxy's frontend listener."
+    gateway:
+      haproxy_concept: "Frontend (`frontend` section)"
+      description: |
+        A `frontend` binds to an address:port and defines how incoming connections are
+        received. Frontends contain ACL rules and `use_backend` directives that route
+        requests to backends. Frontends can also define `default_backend`. SSL termination
+        is configured here via `bind ... ssl crt ...`.
+      session_persistence_config:
+        - "No session persistence config lives at the frontend level in HAProxy."
+        - "Frontends only route traffic to backends — all persistence config is in backends."
+    route_rule:
+      haproxy_concept: "ACLs + `use_backend` rules (in `frontend` section)"
+      description: |
+        HAProxy's routing logic lives in the `frontend` section as ACL rules combined with
+        `use_backend` directives. ACLs match on path, host, headers, etc. and select which
+        backend handles the request. This is analogous to Gateway API's HTTPRoute rules.
+        No session persistence configuration exists at this layer — routing determines which
+        backend is selected, and the backend's persistence config takes over from there.
+      session_persistence_config:
+        - "No session persistence config at the ACL/routing layer."
+        - "ACLs select backends; backends own persistence config."
+    backend_service:
+      haproxy_concept: "Backend (`backend` section)"
+      description: |
+        A `backend` defines a pool of servers (endpoints) and how traffic is distributed
+        among them. ALL session persistence configuration lives here: the `cookie` directive,
+        `stick-table` + `stick on`/`stick match`/`stick store-*` directives, and the
+        `balance` algorithm. This is the central layer for persistence in HAProxy.
+      session_persistence_config:
+        - "`cookie <name> [insert|rewrite|prefix] [indirect] [nocache] [httponly] [secure] [domain <d>] [maxidle <t>] [maxlife <t>] [dynamic] [attr <v>]` — cookie-based persistence"
+        - "`stick-table type <t> size <s> expire <e>` — define stick table"
+        - "`stick on <pattern>` — combined lookup + store (e.g., `stick on src`)"
+        - "`stick match <pattern>` + `stick store-response <pattern>` — lookup on request, store from response"
+        - "`balance [source|uri|url_param|hdr()|rdp-cookie]` — hash-based soft affinity"
+        - "`hash-type consistent` — use consistent hashing for hash-based algorithms"
+    endpoint:
+      haproxy_concept: "Server (`server` line within `backend`)"
+      description: |
+        Individual upstream host (IP:port) defined via `server` lines within a backend.
+        Each server can have a `cookie <value>` parameter that identifies it for cookie-based
+        persistence. Servers can also have `weight`, `check`, `backup`, and other parameters.
+        For `dynamic` cookie mode, the cookie value is auto-generated from the server's
+        IP + port + secret key.
+
+  dataplane_translation:
+    description: |
+      HAProxy is the dataplane — there is no further translation. Controllers generate
+      `haproxy.cfg` configuration files (or modify them via the Runtime API / Data Plane API).
+      Session persistence is configured entirely within `backend` sections:
+
+      Cookie Persistence:
+        `cookie SERVERID insert indirect nocache httponly secure`
+        + `server s1 10.0.0.1:80 check cookie s1`
+        + `server s2 10.0.0.2:80 check cookie s2`
+        The `cookie` directive + per-server `cookie` parameter work together.
+
+      Stick-Table Persistence (source IP):
+        `stick-table type ip size 200k expire 30m`
+        + `stick on src`
+        The table definition + stick rule work together.
+
+      Stick-Table Persistence (application cookie):
+        `stick-table type string len 64 size 100k expire 1h`
+        + `stick match req.cook(JSESSIONID)`
+        + `stick store-response res.cook(JSESSIONID)`
+        Lookup on request cookie, store from response cookie.
+
+      Stick-Table Persistence (header):
+        `stick-table type string len 32 size 50k expire 1h`
+        + `stick on req.hdr(X-Tenant-ID)`
+        Combined lookup + store on header value.
+
+      Hash-Based Affinity:
+        `balance source` / `balance uri` / `balance hdr(Host)`
+        + `hash-type consistent`
+        Single directive + optional consistent hashing.
+    haproxy_features_used:
+      - "`cookie` directive (insert, rewrite, prefix modes)"
+      - "Cookie attributes: `indirect`, `nocache`, `postonly`, `preserve`, `httponly`, `secure`, `domain`, `maxidle`, `maxlife`, `dynamic`, `attr`"
+      - "`dynamic-cookie-key` directive (secret key for dynamic cookies)"
+      - "`stick-table` directive (type ip/ipv6/string/binary/integer, size, expire, len, store, peers)"
+      - "`stick on`, `stick match`, `stick store-request`, `stick store-response` directives"
+      - "Fetch methods: `src`, `req.cook()`, `res.cook()`, `req.hdr()`, `url_param()`, `int()`"
+      - "`balance` algorithms: roundrobin, static-rr, leastconn, first, random, source, uri, url_param, hdr(), rdp-cookie"
+      - "`hash-type` directive: map-based, consistent; hash functions: sdbm, djb2, wt6, crc32"
+      - "`option redispatch` — re-route when target server is unavailable"
+      - "`peers` mechanism — stick table replication for multi-node HA"
+      - "HAProxy Runtime API — dynamic cookie enable/disable, set dynamic-cookie-key"
+      - "HAProxy Data Plane API — programmatic configuration management"
+    key_code_paths:
+      - "src/backend.c — backend server selection, cookie and stick table logic"
+      - "src/stick_table.c — stick table implementation"
+      - "src/cfgparse-listen.c — configuration parsing for cookie/stick-table directives"
+      - "src/proto_http.c — HTTP cookie insertion/extraction"
+      - "src/lb_chash.c — consistent hashing implementation"
+      - "src/lb_map.c — map-based (static) hashing implementation"
+      - "include/haproxy/stick_table-t.h — stick table type definitions"
+      - "include/haproxy/backend-t.h — backend and cookie configuration structures"
+    flow: |
+      Cookie Persistence:
+        Request arrives at frontend → ACL selects backend
+          → HAProxy checks request for persistence cookie (name matches `cookie` directive)
+          → If found: extract server identifier → route to matching server
+          → If not found: normal load balancing → select server
+        Response from server:
+          → insert mode: HAProxy adds `Set-Cookie: <name>=<server-cookie>; [attrs]`
+          → rewrite mode: HAProxy rewrites existing cookie value to server identifier
+          → prefix mode: HAProxy prepends `<server-cookie>~` to existing cookie value
+          → indirect: if client already had valid cookie, no Set-Cookie emitted
+
+      Stick-Table Persistence:
+        Request arrives at frontend → ACL selects backend
+          → `stick on` or `stick match`: extract key from request (src, cookie, header, etc.)
+          → Look up key in stick table
+          → If found: route to associated server
+          → If not found: normal load balancing → select server
+          → `stick on` or `stick store-request`: store key → server mapping
+        Response from server:
+          → `stick store-response`: extract key from response (e.g., Set-Cookie)
+          → Store key → server mapping in stick table
+
+      Hash-Based Balance:
+        Request arrives at frontend → ACL selects backend
+          → `balance source/uri/url_param/hdr/rdp-cookie`: extract property
+          → Hash property → divide by total server weight
+          → `hash-type consistent`: use consistent hash ring → select server
+          → `hash-type map-based`: use modulo mapping → select server
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: true       # Via stick-table with `stick on req.hdr()`
+    source_ip_affinity: true       # Via stick-table with `stick on src` or `balance source`
+    url_encoded_sessions: false    # HAProxy does not support URL-rewriting for session IDs
+    cookie_attributes:
+      name: true                   # First argument to `cookie` directive
+      path: false                  # HAProxy hardcodes `path=/` in source code (`chunk_appendf(&trash, "; path=/");`). No parameter to change it. Using `attr "Path=/foo"` results in duplicate path attributes. Workaround: `http-after-response replace-header` to rewrite.
+      domain: true                 # Via `domain <domain>` parameter (repeatable)
+      ttl: false                   # HAProxy's `cookie` directive does not have an explicit TTL/Max-Age/Expires parameter. `insert` mode creates session cookies by default. `maxlife` and `maxidle` are server-side timers that control when HAProxy ignores an otherwise valid cookie — they do NOT set cookie Max-Age/Expires attributes.  A `Max-Age` attribute can be added via `attr "Max-Age=3600"`.
+      secure: true                 # Via `secure` keyword
+      http_only: true              # Via `httponly` keyword
+      same_site: true              # Via `attr "SameSite=Strict"` (or Lax, None)
+    idle_timeout: true             # Via `maxidle` — server-side timer, HAProxy ignores the cookie after idle period
+    absolute_timeout: true         # Via `maxlife` — server-side timer, HAProxy ignores the cookie after absolute lifetime
+    lifetime_type_session: true    # `insert` mode creates session cookies by default (no Expires/Max-Age)
+    lifetime_type_permanent: true  # Can set `Max-Age` or `Expires` via `attr` parameter
+
+  limitations:
+    - "`cookie` directive `insert` mode creates session cookies only — there is no built-in parameter to set `Max-Age` or `Expires`. Permanent cookies require using the generic `attr` escape hatch (e.g., `attr \"Max-Age=3600\"`)"
+    - "`cookie` directive has no dedicated `Path` parameter — the cookie path defaults to the request path (browser behavior). Must use `attr \"Path=/\"` for explicit path setting"
+    - "`maxidle` and `maxlife` are server-side timers only — they control when HAProxy ignores cookies, but do NOT set client-side cookie expiry attributes. The client-side cookie may persist in the browser longer than HAProxy honors it"
+    - "`rewrite` mode does not work in HTTP tunnel mode and requires monitoring all responses — not recommended for new deployments"
+    - "`prefix` mode may strip existing cookie attributes (`Secure`, `HttpOnly`, `SameSite`) from the original application cookie — they must be re-added explicitly"
+    - "Stick tables are in-memory and local to the HAProxy process by default — peer replication is needed for multi-node HA. Without replication, failover loses all session mappings"
+    - "Each backend can have only one stick table — but up to 8 `stick` directives can reference it with different patterns"
+    - "Hash-based balance algorithms (`source`, `uri`, etc.) are soft affinity — adding or removing servers breaks affected sessions. `hash-type consistent` limits disruption to ~1/N sessions but does not eliminate it"
+    - "`balance source` is affected by NAT — all clients behind the same NAT share a source IP and are mapped to the same server, causing uneven load"
+    - "Stick table entries without `expire` never expire and accumulate until the table is full"
+    - "Cookie values in `insert` mode are plaintext server identifiers (not encrypted or signed) — they reveal backend server names to clients. `dynamic` mode hashes the IP+port+key, which is more opaque but still not cryptographically secure"
+    - "`dynamic-cookie-key` secret must be identical across all HAProxy instances for consistent cookie generation in multi-node deployments"
+    - "`stick store-request` must be declared AFTER `stick match` in config to avoid race conditions where a new entry overwrites the lookup result before it is used"
+
+  known_issues: []
+
+# Dataplanes don't implement Gateway API, so no gwapi_assessment.
+# Instead, we document which implementations use this dataplane and how.
+downstream_implementations:
+  - name: HAProxy Ingress (by jcmoraisjr)
+    repo: https://github.com/jcmoraisjr/haproxy-ingress
+    controller_name: "haproxy-ingress.github.io/controller"
+    gwapi_conformant: true
+    gwapi_conformance_version: "v1.5.1"
+    uses_mechanisms:
+      - Cookie Persistence
+    notes: |
+      Community-driven HAProxy ingress controller. Conformant Gateway API implementation
+      since v0.17 — implements all core features from the standard channel plus TLSRoute
+      and TCPRoute from the experimental channel. Uses HAProxy's `cookie insert` mode for
+      session persistence. Configurable via Ingress annotations: `affinity`, `cookie-key`,
+      `session-cookie-name`, `session-cookie-domain`, `session-cookie-dynamic`,
+      `session-cookie-keywords`, `session-cookie-preserve`, `session-cookie-same-site`,
+      `session-cookie-shared`, `session-cookie-strategy`, `session-cookie-value-strategy`.
+      Generates a reproducible hash for server cookie values based on endpoint IP:port.
+      Referenced in GEP-1619 for its `session-cookie-keywords` field as an example of
+      providing flexibility for simple boolean-typed cookie attributes.
+  - name: HAProxy Kubernetes Ingress Controller (by HAProxy Technologies)
+    repo: https://github.com/haproxytech/kubernetes-ingress
+    controller_name: "haproxy.org/gateway-controller"
+    gwapi_conformant: false
+    gwapi_conformance_version: null
+    uses_mechanisms:
+      - Cookie Persistence
+    notes: |
+      Official HAProxy Technologies ingress controller. Built-in Gateway API support since
+      version 1.10, but has not submitted conformance reports and does not appear in the
+      Gateway API conformance reports. Listed on the Gateway API implementations page without
+      a conformance badge. Uses HAProxy's `cookie insert` mode with `dynamic` cookies by
+      default for session persistence across multiple controller replicas. HAProxy Technologies
+      appears to be shifting Gateway API focus to the newer HAProxy Unified Gateway product.
+  - name: HAProxy Unified Gateway (HUG) (by HAProxy Technologies)
+    repo: https://github.com/haproxytech/haproxy-unified-gateway
+    controller_name: null
+    gwapi_conformant: false
+    gwapi_conformance_version: null
+    uses_mechanisms:
+      - Cookie Persistence
+      - Stick-Table Persistence
+    notes: |
+      New open-source Gateway API controller from HAProxy Technologies, announced as a
+      dedicated Gateway API implementation (separate from the Kubernetes Ingress Controller).
+      Currently in beta (as of April 2026) with incomplete Gateway API coverage. Future
+      releases plan to add progressive Gateway API conformance and Ingress API support.
+      The enterprise version will be integrated into HAProxy One in 2026. Helm chart v1.0.0
+      released March 2026.

@@ -139,7 +139,8 @@ implementations:
     type: controller
     dataplane: HAProxy
     has_session_persistence: true
-    gwapi_support: true
+    gwapi_support: false
+    note: "Native cookie persistence via annotations. No GWAPI sessionPersistence support."
 
   # --- Controllers with other dataplanes ---
   - name: BIG-IP Kubernetes Gateway
@@ -171,9 +172,10 @@ implementations:
 
   - name: Cilium
     type: integrated
-    dataplane: Built-in (eBPF)
+    dataplane: eBPF + Envoy L7
     has_session_persistence: false
-    gwapi_support: true
+    gwapi_support: false
+    note: "L3/L4 source IP affinity via eBPF only. stateful_session filter not compiled into Envoy build."
 
   - name: Linkerd
     type: integrated

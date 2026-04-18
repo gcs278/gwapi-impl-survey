@@ -491,6 +491,10 @@ gwapi_assessment:
       native_field: null
       mapping_difficulty: not_supported
       notes: "Not supported. Envoy's stateful_session filter also does not support idle timeout."
+    - gwapi_field: "cookie path (computed)"
+      native_field: "Hardcoded to '/' — not configurable"
+      mapping_difficulty: not_supported
+      notes: "Cookie path is hardcoded to '/'. No computation from route path matches."
 
   deviations:
     - "Contour uses ONLY consistent hashing (RING_HASH) for session affinity — no stateful_session filter support"

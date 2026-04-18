@@ -1,0 +1,560 @@
+metadata:
+  name: HAProxy Ingress
+  type: controller
+  dataplane: HAProxy
+  version_analyzed: "v0.17.0-alpha.1 (latest alpha, March 2026); v0.16.0 (latest stable)"
+  repo_url: https://github.com/jcmoraisjr/haproxy-ingress
+  docs_url: https://haproxy-ingress.github.io/
+  last_updated: 2026-04-17
+
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Gateway API / Ingress
+      type: gwapi
+      resources:
+        - "`HTTPRoute` (partial — no `sessionPersistence` support)"
+        - "`TCPRoute`"
+        - "Ingress annotations (`haproxy-ingress.github.io/affinity`, `session-cookie-*`)"
+      description: |
+        User-facing API. HAProxy Ingress reads Gateway API resources (HTTPRoute, Gateway, GatewayClass,
+        TCPRoute) and Ingress resources. Session persistence is currently ONLY configurable via Ingress
+        annotations or Service annotations — Gateway API's `sessionPersistence` field on HTTPRoute rules
+        is NOT implemented. Target Services can be annotated with backend-scoped configuration keys
+        (like `affinity` and `session-cookie-*`) and this works for both Ingress and Gateway API workloads.
+    - name: Internal HAProxy Model
+      type: intermediate
+      resources:
+        - "`hatypes.Backend` with `Cookie` struct"
+        - "`hatypes.Cookie` (Name, Strategy, Keywords, Dynamic, Preserve, Domain)"
+        - "`haproxy.Config` interface"
+      description: |
+        The converter pipeline (ingress converter and gateway converter) translates Kubernetes resources
+        into an internal Go model (`pkg/haproxy/types`). The `Backend` struct contains a `Cookie` field
+        with all session persistence settings. This intermediate model is then rendered into HAProxy
+        configuration via Go templates.
+    - name: haproxy.cfg
+      type: dataplane
+      resources:
+        - "`backend` section with `cookie` directive"
+        - "`server` lines with `cookie` attribute"
+        - "`dynamic-cookie-key` directive"
+        - "`balance` algorithm (source, roundrobin, etc.)"
+      description: |
+        Generated `haproxy.cfg` configuration file. HAProxy Ingress renders Go templates
+        (`haproxy.tmpl`) into the HAProxy configuration and triggers a reload. The `cookie`
+        directive in backend sections controls session persistence behavior.
+
+native_profile:
+  overview: |
+    HAProxy Ingress (jcmoraisjr/haproxy-ingress) is a community-driven Kubernetes ingress controller
+    that configures HAProxy as its dataplane. It is distinct from the HAProxy Technologies Kubernetes
+    Ingress Controller (haproxytech/kubernetes-ingress) — they are separate projects.
+
+    HAProxy Ingress supports session persistence exclusively through cookie-based affinity, configured
+    via annotation-style configuration keys. The `affinity` key (only value: `cookie`) enables cookie-
+    based sticky sessions, and a rich set of `session-cookie-*` keys control the cookie behavior.
+
+    The controller uses a converter-based architecture:
+      1. Ingress/Gateway API resources are watched via controller-runtime
+      2. Converters (`pkg/converters/ingress/`, gateway converter) parse annotations and specs
+      3. An internal HAProxy model (`pkg/haproxy/types`) is populated
+      4. Go templates (`haproxy.tmpl`) render the model into `haproxy.cfg`
+      5. HAProxy is reloaded (or updated dynamically where possible)
+
+    Session persistence in HAProxy Ingress maps directly to HAProxy's native `cookie` directive in
+    backend sections. The controller supports three cookie strategies: `insert` (default), `rewrite`,
+    and `prefix`, which correspond to HAProxy's native cookie modes. Dynamic cookie values (hashed
+    from server IP + port + secret key) are used by default, or static server names / pod UIDs can
+    be used as cookie values.
+
+    HAProxy Ingress does NOT implement Gateway API's `sessionPersistence` field on `HTTPRoute` rules.
+    Session persistence is only available via Ingress annotations or Service annotations — not
+    through Gateway API native fields. However, since target Services can be annotated with
+    backend-scoped configuration keys, session persistence CAN work with Gateway API workloads
+    indirectly (by annotating the backend Service).
+
+    HAProxy Ingress achieved Gateway API conformance in v0.17, implementing all core standard
+    channel features plus experimental TLSRoute and TCPRoute.
+
+  mechanisms:
+    - name: Cookie Affinity
+      type: strong_persistence
+      description: |
+        Uses HAProxy's native `cookie` directive in backend sections to insert, rewrite, or prefix
+        a session cookie that identifies the backend server. On subsequent requests, HAProxy reads
+        the cookie and routes to the same backend server, bypassing the load balancer. If the backend
+        server is unavailable, HAProxy falls back to the configured load balancing algorithm and
+        updates the cookie. This provides strong session persistence tied to a specific backend.
+
+        HAProxy Ingress supports three cookie strategies:
+        - `insert`: HAProxy inserts a new cookie into responses (default)
+        - `rewrite`: HAProxy rewrites an existing application cookie with the server identifier
+        - `prefix`: HAProxy prepends the server identifier to an existing application cookie value
+
+        By default, dynamic cookie values are used — HAProxy generates a hash from the server's
+        IP address, TCP port, and a configurable secret key (`cookie-key`). Alternatively, the
+        server name or pod UID can be used as the cookie value.
+      enabled_by_default: false
+      configuration_method: "Ingress/Service annotation (`haproxy-ingress.github.io/affinity: cookie`)"
+
+      config_options:
+        - field: affinity
+          type: "enum (cookie)"
+          required: true
+          default: null
+          description: "Enables cookie-based session affinity. The only supported value is `cookie`."
+          support_level: full
+        - field: session-cookie-name
+          type: string
+          required: false
+          default: "INGRESSCOOKIE"
+          description: "The name of the persistence cookie."
+          support_level: full
+        - field: session-cookie-strategy
+          type: "enum (insert, rewrite, prefix)"
+          required: false
+          default: "insert"
+          description: |
+            The cookie strategy to use. `insert` = HAProxy inserts a new cookie. `rewrite` = HAProxy
+            rewrites an existing application cookie. `prefix` = HAProxy prepends server ID to an existing
+            cookie value. These map directly to HAProxy's native cookie modes.
+          support_level: full
+        - field: session-cookie-keywords
+          type: string
+          required: false
+          default: "indirect nocache httponly (when strategy is insert)"
+          description: |
+            Additional HAProxy cookie keywords such as `nocache`, `httponly`, `indirect`, `secure`,
+            `postonly`, etc. Passed directly to HAProxy's `cookie` directive. For backwards compatibility,
+            defaults to `indirect nocache httponly` when strategy is `insert`.
+          support_level: full
+        - field: session-cookie-dynamic
+          type: bool
+          required: false
+          default: "true"
+          description: |
+            Whether dynamic cookie values are used. When `true`, HAProxy generates a hash from the
+            server IP, TCP port, and `cookie-key` secret. When `false`, the server name is used as the
+            cookie value. Has no impact if `use-resolver` is set.
+          support_level: full
+        - field: session-cookie-domain
+          type: string
+          required: false
+          default: null
+          description: |
+            The domain to which the persistence cookie should be sent. All subdomains of the configured
+            domain will also receive the cookie. The ingress hostname must match this configuration or
+            be a subdomain.
+          support_level: full
+        - field: session-cookie-preserve
+          type: bool
+          required: false
+          default: "false"
+          description: |
+            When `true`, HAProxy allows backend servers to emit their own persistence cookie values
+            via `Set-Cookie`, and dynamic updating keeps the same cookie value associated with the
+            same backend server. Useful when backends manage their own session identifiers.
+          support_level: full
+        - field: session-cookie-same-site
+          type: bool
+          required: false
+          default: "false"
+          description: |
+            If `true`, adds `SameSite=None; Secure` attributes to the cookie, allowing the browser to
+            send the persistence cookie with both cross-site and same-site requests.
+          support_level: full
+        - field: session-cookie-value-strategy
+          type: "enum (server-name, pod-uid)"
+          required: false
+          default: "server-name"
+          description: |
+            The strategy for calculating the cookie value of a server. `server-name` uses the name from
+            `backend-server-naming`. `pod-uid` uses the Kubernetes UID of the pod running the target server.
+          support_level: full
+        - field: session-cookie-shared
+          type: bool
+          required: false
+          default: "false"
+          description: |
+            Shares the session cookie across backends with the same cookie configuration.
+            `session-cookie-domain` has precedence over this setting.
+          support_level: full
+        - field: cookie-key
+          type: string
+          required: false
+          default: "Ingress"
+          description: |
+            A secret key used with the IP address and port number of a backend server to dynamically
+            create a cookie value. Used when `session-cookie-dynamic` is `true`.
+          support_level: full
+
+      attachment_model:
+        attaches_to: Backend (Service)
+        resource_type: "Ingress annotation or Service annotation"
+        scope: "per-backend (backend-scoped configuration key)"
+
+  attachment_points:
+    - mechanism: Cookie Affinity
+      layer: backend_service
+      native_resource: "Ingress/Service annotations (`haproxy-ingress.github.io/affinity`, `session-cookie-*`)"
+      description: |
+        Cookie affinity is configured at the backend level via annotations on Ingress resources or
+        target Services. All Ingress/Gateway API resources referencing the same backend Service share
+        the same cookie affinity configuration. For Gateway API workloads, the target Service can be
+        annotated with backend-scoped configuration keys (e.g., `haproxy-ingress.github.io/affinity: cookie`)
+        since Gateway API resources themselves do not support annotations in HAProxy Ingress.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "not implemented"
+      dataplane_target:
+        name: "HAProxy cookie directive"
+        label: "would generate"
+    btp:
+      target_layer: backend_service
+      label: "not implemented"
+      dataplane_target:
+        name: "HAProxy cookie directive"
+        label: "would generate"
+
+  dataplane_translation:
+    description: |
+      HAProxy Ingress uses a multi-stage translation pipeline:
+
+      1. **Resource Watching**: controller-runtime watches Kubernetes resources (Ingress, Gateway,
+         HTTPRoute, Services, ConfigMaps, etc.) and triggers reconciliation on changes.
+
+      2. **Converter Stage**: Converters parse resources and annotations into the internal model.
+         - Ingress converter (`pkg/converters/ingress/`): Reads Ingress annotations, parses
+           `affinity`, `session-cookie-*` keys, and populates `hatypes.Backend.Cookie`.
+         - Gateway converter: Reads Gateway API resources (HTTPRoute, Gateway, etc.).
+         - Annotations mapper (`pkg/converters/ingress/annotations/`): Maps annotation values
+           to backend configuration, including cookie strategy, name, keywords, etc.
+
+      3. **Internal Model**: The `haproxy.Config` interface and `hatypes.Backend` struct hold the
+         parsed configuration. The `Cookie` struct has fields: `Name`, `Strategy`, `Keywords`,
+         `Dynamic`, `Preserve`, `Domain`, and `Shared`.
+
+      4. **Template Rendering**: Go templates (`haproxy.tmpl`) render the internal model into
+         `haproxy.cfg`. Cookie affinity is rendered as:
+         - `cookie {name} {strategy} {keywords}` in the backend section
+         - `dynamic-cookie-key {key}` if dynamic cookies are enabled
+         - `cookie {value}` on each `server` line if `CookieAffinity` is set on the backend
+
+      5. **HAProxy Reload**: The generated configuration is written to disk and HAProxy is
+         reloaded (or updated via the runtime API for dynamic changes).
+
+      For Gateway API workloads, session persistence uses the same backend-level cookie
+      configuration — there is no Gateway API-specific session persistence translation path.
+      The target Service is annotated, and the annotation values flow through the same converter
+      pipeline as Ingress workloads.
+
+    haproxy_features_used:
+      - "`cookie {name} insert indirect nocache httponly` — default cookie insertion"
+      - "`cookie {name} rewrite` — cookie rewriting mode"
+      - "`cookie {name} prefix` — cookie prefix mode"
+      - "`dynamic-cookie-key {key}` — dynamic cookie value generation"
+      - "`server ... cookie {value}` — per-server cookie value assignment"
+      - "`balance source` — source IP hash load balancing (soft affinity)"
+      - "`balance roundrobin` / `balance random(2)` — default load balancing algorithms"
+    key_code_paths:
+      - "`pkg/converters/ingress/annotations/backend.go` — parses `affinity`, `session-cookie-*` annotations into `hatypes.Cookie`"
+      - "`pkg/converters/ingress/annotations/backend_test.go` — test cases for cookie affinity configuration"
+      - "`pkg/haproxy/types/` — `Backend` struct with `Cookie` field, `Cookie` struct definition"
+      - "`pkg/converters/ingress/ingress.go` — Ingress converter, `ReadAnnotations()` for backend config"
+      - "`rootfs/etc/templates/haproxy/haproxy.tmpl` — Go template rendering cookie directives in backend sections"
+      - "`pkg/haproxy/` — `Config` interface, HAProxy configuration model"
+      - "`pkg/converters/configmap/` — ConfigMap converter for global/default configuration"
+    flow: |
+      Cookie Affinity (via annotations):
+        Ingress/Service annotation `haproxy-ingress.github.io/affinity: cookie`
+          + `session-cookie-name`, `session-cookie-strategy`, `session-cookie-keywords`, etc.
+          -> pkg/converters/ingress/annotations/backend.go: parse annotations
+            -> hatypes.Cookie {
+                 Name: "INGRESSCOOKIE",
+                 Strategy: "insert",
+                 Keywords: "indirect nocache httponly",
+                 Dynamic: true,
+                 Preserve: false,
+                 Domain: ""
+               }
+          -> hatypes.Backend.Cookie populated
+          -> haproxy.tmpl renders:
+            backend {name}
+              cookie {cookie.Name} {cookie.Strategy} {cookie.Keywords}
+              dynamic-cookie-key {cookie-key}
+              server {name} {ip}:{port} cookie {cookieValue}
+
+      Source IP Hash (soft affinity):
+        Ingress/Service annotation `haproxy-ingress.github.io/balance-algorithm: source`
+          -> hatypes.Backend.BalanceAlgorithm = "source"
+          -> haproxy.tmpl renders:
+            backend {name}
+              balance source
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: false
+    source_ip_affinity: true    # Via `balance-algorithm: source` (soft affinity only)
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true               # `session-cookie-name`
+      path: false              # Not supported — feature request exists but unimplemented
+      domain: true             # `session-cookie-domain`
+      ttl: false               # No TTL/maxlife configuration — HAProxy supports `maxlife` but controller does not expose it
+      secure: true             # Via `session-cookie-keywords: secure` or `session-cookie-same-site: true`
+      http_only: true          # Via `session-cookie-keywords: httponly` (default for insert strategy)
+      same_site: true          # `session-cookie-same-site: true` adds `SameSite=None; Secure`
+    idle_timeout: false        # No idle timeout for session cookies — HAProxy supports `maxidle` but controller does not expose it
+    absolute_timeout: false    # No absolute timeout for session cookies — HAProxy supports `maxlife` but controller does not expose it
+    lifetime_type_session: true   # Default — cookies are session cookies (no explicit expiry)
+    lifetime_type_permanent: false # No TTL/maxlife control exposed — cookies are always session-scoped
+
+  limitations:
+    - "No Gateway API `sessionPersistence` field support — session persistence is annotation-only"
+    - "Gateway API resources do not support annotations; session persistence for Gateway API workloads requires annotating the target Service"
+    - "Only cookie-based affinity is supported — no header-based persistence"
+    - "Source IP affinity is only available as soft affinity via `balance-algorithm: source`, not as strong persistence via stick-tables"
+    - "No cookie path configuration — feature request exists (GitHub) but unimplemented"
+    - "No cookie TTL/maxlife/maxidle exposed — HAProxy supports these natively (`maxlife`, `maxidle` in `cookie` directive) but the controller does not expose them"
+    - "Cookie `SameSite` is limited to `SameSite=None; Secure` — no support for `SameSite=Lax` or `SameSite=Strict`"
+    - "HTTPRoute Rules and BackendRefs do not support Filters (documented limitation as of v0.15; improved in v0.17)"
+    - "Dynamic cookie values may get out of sync with servers during scaling unless `session-cookie-preserve` is enabled"
+    - "No `BackendTrafficPolicy` or `BackendLBPolicy` support"
+    - "`session-cookie-domain` is backend-scoped — configuration conflicts when multiple Ingress resources point to the same Service with different values"
+    - "HAProxy Ingress v0.17 is still in alpha (v0.17.0-alpha.1 as of March 2026)"
+
+  known_issues:
+    - url: "https://github.com/jcmoraisjr/haproxy-ingress/issues/674"
+      description: "Feature request for SameSite cookie attribute support. Led to addition of `session-cookie-same-site` but limited to `SameSite=None; Secure` only."
+    - url: "https://github.com/jcmoraisjr/haproxy-ingress/issues/18"
+      description: "Original feature request for sticky sessions support (2017). Implemented via `affinity: cookie`."
+    - url: "https://github.com/jcmoraisjr/haproxy-ingress/issues/134"
+      description: "Bug report: no affinity cookie provided by HAProxy when using annotations."
+    - url: "https://github.com/jcmoraisjr/haproxy-ingress/issues/373"
+      description: "Bug report: ingress stick session not working — cookie not appearing in browser."
+    - url: "https://github.com/jcmoraisjr/haproxy-ingress/issues/541"
+      description: "Proposal to move from configuration templating to HAProxy Data Plane APIs for better scalability."
+
+gwapi_assessment:
+  overview: |
+    HAProxy Ingress does NOT implement Gateway API's `sessionPersistence` field on `HTTPRoute` rules
+    or any Gateway API-native session persistence mechanism. Session persistence is currently only
+    available through annotation-based configuration keys (`affinity: cookie` and `session-cookie-*`),
+    which are applied at the backend (Service) level.
+
+    For Gateway API workloads, session persistence can be achieved indirectly by annotating the target
+    Service with backend-scoped configuration keys. However, this is a workaround — Gateway API
+    resources themselves do not support annotations in HAProxy Ingress, and this approach does not
+    provide per-route-rule granularity.
+
+    HAProxy Ingress achieved Gateway API conformance in v0.17 (all standard channel core features
+    plus experimental TLSRoute and TCPRoute), but the conformance reports do not include session
+    persistence features. The v0.17 conformance report shows many extended features as unsupported,
+    including `HTTPRouteBackendTimeout`, `HTTPRouteRequestTimeout`, `HTTPRouteMethodMatching`,
+    `HTTPRoutePathRedirect`, `HTTPRoutePathRewrite`, and others.
+
+    HAProxy's native dataplane has strong cookie-based persistence capabilities (`cookie` directive
+    with insert/rewrite/prefix modes, `maxlife`, `maxidle`, `domain`, `httponly`, `secure`, `attr`
+    options), and stick-table-based IP persistence. The controller currently exposes a subset of
+    these capabilities through annotations. Implementing Gateway API `sessionPersistence` would
+    require adding a new code path in the Gateway API converter to read `HTTPRoute.rule.sessionPersistence`
+    and map it to the existing `hatypes.Cookie` model.
+
+  route_inline:
+    difficulty: moderate
+    description: |
+      Route-inline session persistence is NOT implemented. HAProxy Ingress would need to:
+
+      1. Read `rule.sessionPersistence` from `HTTPRoute` resources in the Gateway API converter
+      2. Map Gateway API `SessionPersistence` fields to the existing `hatypes.Cookie` model:
+         - `sessionName` -> `Cookie.Name`
+         - `type: Cookie` -> use existing cookie affinity mechanism
+         - `type: Header` -> NOT supported by HAProxy Ingress (would require new mechanism)
+         - `absoluteTimeout` -> HAProxy's `maxlife` parameter (currently not exposed by controller)
+         - `cookieConfig.lifetimeType` -> session vs permanent cookie (currently always session)
+      3. Apply cookie configuration per-route-rule rather than per-backend
+
+      The main challenge is architectural: HAProxy Ingress's session persistence is currently
+      backend-scoped (all routes sharing a backend share the same cookie config), while Gateway
+      API's `sessionPersistence` is route-rule-scoped. HAProxy's `cookie` directive is also
+      backend-scoped, so per-route-rule persistence would require either:
+      - Creating separate HAProxy backends per route rule with session persistence
+      - Using HAProxy ACLs and Lua to apply different cookie behavior per route
+
+      Additionally, HAProxy Ingress does not currently expose `maxlife` or `maxidle` parameters
+      from HAProxy's cookie directive, which would be needed for `absoluteTimeout` and
+      `idleTimeout` mapping.
+
+      Header-based persistence (`type: Header`) has no equivalent in HAProxy's cookie directive
+      and would require a fundamentally different approach (stick-tables with header-based keys,
+      or Lua scripting).
+    mapping_strategy: |
+      `HTTPRoute.rule.sessionPersistence` -> Gateway API converter reads the field
+        -> Map to `hatypes.Cookie` struct with appropriate fields
+        -> Render via `haproxy.tmpl` as `cookie` directive in backend section
+
+      Key challenge: HAProxy's `cookie` directive is backend-scoped, not route-scoped.
+      Per-route-rule session persistence would require backend splitting or ACL-based
+      cookie manipulation.
+    gotchas:
+      - "HAProxy's `cookie` directive is backend-scoped — per-route-rule persistence requires architectural changes"
+      - "Header-based persistence has no direct HAProxy equivalent"
+      - "Cookie TTL (`absoluteTimeout`) maps to HAProxy `maxlife` which is not currently exposed by the controller"
+      - "Cookie `idleTimeout` maps to HAProxy `maxidle` which is not currently exposed by the controller"
+      - "`lifetimeType: Permanent` requires `maxlife` support to set cookie expiration"
+      - "Gateway API `cookieConfig` fields beyond `lifetimeType` are not yet defined in the spec"
+      - "The `insert` strategy is the natural match for Gateway API — `rewrite` and `prefix` are HAProxy-specific"
+    code_changes_needed:
+      - "Gateway API converter: read `HTTPRoute.rule.sessionPersistence` from route rules"
+      - "`pkg/haproxy/types`: extend `Cookie` struct to support `maxlife` and `maxidle` parameters"
+      - "`haproxy.tmpl`: render `maxlife` and `maxidle` in `cookie` directive"
+      - "Handle per-route-rule session persistence vs per-backend scope mismatch"
+      - "Add validation for `type: Header` (reject or implement via stick-tables)"
+      - "Add session persistence conformance tests"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      `BackendTrafficPolicy` / `BackendLBPolicy` for session persistence is NOT implemented.
+      However, the existing annotation-based model already attaches session persistence at the
+      backend (Service) level, which aligns well with `BackendTrafficPolicy`'s attachment model.
+
+      Implementing BTP session persistence would require:
+      1. Watching for `BackendTrafficPolicy` or `BackendLBPolicy` resources
+      2. Extracting `sessionPersistence` config from the policy
+      3. Mapping to the existing `hatypes.Cookie` model
+      4. The translation to HAProxy config would use the same `cookie` directive in backend sections
+
+      This is actually a more natural fit than route-inline for HAProxy Ingress, since the native
+      session persistence is already backend-scoped. The main work is adding the CRD watcher and
+      the translation logic from BTP to the internal cookie model.
+
+      Precedence between BTP and annotation-based configuration would need to be defined.
+    mapping_strategy: |
+      `BackendTrafficPolicy.sessionPersistence` -> watch BTP resources
+        -> Map `sessionPersistence` fields to `hatypes.Cookie` struct
+        -> Apply to backend -> render as `cookie` directive in `haproxy.cfg`
+
+      This maps more naturally than route-inline because both BTP and HAProxy's `cookie`
+      directive operate at the backend/service level.
+    gotchas:
+      - "Need to define precedence between BTP session persistence and annotation-based config"
+      - "BTP targets Services — aligns with existing backend-scoped cookie configuration"
+      - "Same `maxlife`/`maxidle` exposure gap applies"
+      - "Header-based persistence in BTP has no direct HAProxy equivalent"
+    code_changes_needed:
+      - "Add `BackendTrafficPolicy` / `BackendLBPolicy` CRD watcher"
+      - "Add BTP-to-Cookie translation in converter pipeline"
+      - "Define precedence: BTP vs annotations vs route-inline"
+      - "Extend `Cookie` struct for `maxlife`/`maxidle` if needed for `absoluteTimeout`/`idleTimeout`"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "HAProxy `cookie` directive with `insert` strategy (default)"
+      mapping_difficulty: direct
+      notes: |
+        Direct mapping. HAProxy's `cookie` directive in `insert` mode creates and manages a
+        persistence cookie, which is functionally equivalent to Gateway API's cookie-based
+        session persistence.
+    - gwapi_field: "type: Header"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: |
+        HAProxy has no native header-based session persistence directive. Could potentially be
+        implemented via stick-tables with header-based keys (`stick on hdr(X-Session-ID)`) or
+        Lua scripting, but this would require significant new code in the controller.
+    - gwapi_field: "sessionName"
+      native_field: "`session-cookie-name` annotation -> `Cookie.Name` -> `cookie {name}` directive"
+      mapping_difficulty: direct
+      notes: "Direct mapping to the cookie name in HAProxy's `cookie` directive. Default is `INGRESSCOOKIE`."
+    - gwapi_field: "absoluteTimeout"
+      native_field: "HAProxy `maxlife` parameter in `cookie` directive"
+      mapping_difficulty: translation_needed
+      notes: |
+        HAProxy natively supports `maxlife` on the `cookie` directive, but HAProxy Ingress does
+        NOT currently expose this parameter. Would need to add `maxlife` support to the `Cookie`
+        struct and template rendering.
+    - gwapi_field: "idleTimeout"
+      native_field: "HAProxy `maxidle` parameter in `cookie` directive"
+      mapping_difficulty: translation_needed
+      notes: |
+        HAProxy natively supports `maxidle` on the `cookie` directive, but HAProxy Ingress does
+        NOT currently expose this parameter. Unlike Envoy-based implementations where `idleTimeout`
+        is fundamentally unsupported, HAProxy CAN support this — it just needs to be exposed by
+        the controller.
+    - gwapi_field: "cookieConfig.lifetimeType: Session"
+      native_field: "Default behavior — no `maxlife` on cookie"
+      mapping_difficulty: direct
+      notes: "By default, HAProxy Ingress creates session cookies (no explicit expiry). This is the current behavior."
+    - gwapi_field: "cookieConfig.lifetimeType: Permanent"
+      native_field: "HAProxy `maxlife` parameter in `cookie` directive"
+      mapping_difficulty: translation_needed
+      notes: |
+        Would require exposing HAProxy's `maxlife` parameter. Currently, all cookies are session-
+        scoped. Making them persistent requires setting `maxlife` to the `absoluteTimeout` value.
+    - gwapi_field: "cookie path (computed)"
+      native_field: "HAProxy `attr` parameter (e.g. `attr \"Path=/foo\"`)"
+      mapping_difficulty: translation_needed
+      notes: "HAProxy supports cookie path via the generic `attr` escape hatch. Not currently exposed by HAProxy Ingress annotations."
+
+  deviations:
+    - "HAProxy Ingress session persistence is backend-scoped (per-Service), not route-rule-scoped like Gateway API's `sessionPersistence`"
+    - "Gateway API resources do not support annotations — session persistence for Gateway API workloads requires annotating the target Service"
+    - "No `sessionPersistence` field on `HTTPRoute` rules — only annotation-based configuration"
+    - "No header-based persistence — only cookie-based"
+    - "Cookie TTL (`maxlife`) and idle timeout (`maxidle`) are HAProxy native features but NOT exposed by the controller"
+    - "The `insert`/`rewrite`/`prefix` strategy concept is HAProxy-specific and has no Gateway API equivalent"
+    - "Dynamic cookie values (hashed from server IP+port+key) are HAProxy-specific — Gateway API does not specify cookie value generation"
+    - "`session-cookie-same-site` only supports `SameSite=None; Secure` — no `Lax` or `Strict` options"
+    - "Cookie path is not configurable (feature request exists but unimplemented)"
+    - "HAProxy Ingress has `session-cookie-preserve` mode where backends set their own cookies — this is beyond Gateway API's scope"
+    - "HAProxy natively supports `idleTimeout` via `maxidle` — this is a notable difference from Envoy-based implementations where `idleTimeout` is fundamentally unsupported"
+    - "Source IP persistence via stick-tables is a HAProxy native feature not exposed by the controller"
+
+  overall_difficulty: moderate
+  summary: |
+    HAProxy Ingress does NOT currently implement Gateway API's `sessionPersistence` field. Session
+    persistence is available only through annotation-based configuration keys, applied at the
+    backend (Service) level. For Gateway API workloads, the workaround is to annotate the target
+    Service with `haproxy-ingress.github.io/affinity: cookie` and related `session-cookie-*` keys.
+
+    Implementing Gateway API session persistence would be MODERATE difficulty because:
+
+    1. **Route-inline is architecturally challenging**: HAProxy's `cookie` directive is backend-scoped,
+       but Gateway API's `sessionPersistence` is route-rule-scoped. Per-route-rule persistence would
+       require backend splitting or ACL-based cookie manipulation — a significant architectural change.
+
+    2. **BackendTrafficPolicy is a better fit**: BTP/BackendLBPolicy targets Services, which aligns
+       with HAProxy's backend-scoped `cookie` directive. The existing annotation-based model already
+       works this way, so BTP would be a more natural Gateway API integration point.
+
+    3. **Field mapping is mostly feasible**: `sessionName` maps directly to `session-cookie-name`.
+       `absoluteTimeout` and `idleTimeout` map to HAProxy's `maxlife` and `maxidle` (which exist
+       natively but are not exposed by the controller). `lifetimeType` maps to cookie expiry behavior.
+
+    4. **Header-based persistence is unsupported**: Gateway API's `type: Header` has no direct
+       HAProxy equivalent. It could potentially be implemented via stick-tables or Lua, but this
+       would be significant work.
+
+    5. **HAProxy has BETTER idle timeout support than Envoy**: Unlike Envoy-based implementations
+       that cannot support `idleTimeout` at all, HAProxy natively supports `maxidle` on the `cookie`
+       directive. This is a potential advantage for HAProxy Ingress if `idleTimeout` is exposed.
+
+    Key strengths:
+    - Mature cookie persistence with three strategies (insert/rewrite/prefix)
+    - Rich cookie attribute support (name, domain, httpOnly, secure, SameSite, dynamic values)
+    - HAProxy natively supports `maxlife` and `maxidle` (unlike Envoy which cannot do `idleTimeout`)
+    - Backend-scoped model aligns well with BTP attachment
+    - Gateway API conformance achieved (v0.17)
+    - Drain support with cookie affinity for graceful pod termination
+
+    Key gaps:
+    - No Gateway API `sessionPersistence` field support at all
+    - No header-based persistence
+    - Cookie TTL/idle timeout not exposed despite HAProxy supporting them natively
+    - Per-route-rule persistence requires architectural changes (backend splitting)
+    - Cookie path not configurable
+    - v0.17 still in alpha
