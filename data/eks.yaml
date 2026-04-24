@@ -1,0 +1,447 @@
+metadata:
+  name: Amazon EKS
+  type: cloud_managed
+  dataplane: AWS VPC Lattice
+  version_analyzed: "AWS Gateway API Controller v2.0.1, Gateway API v1.4.0, April 2026"
+  repo_url: https://github.com/aws/aws-application-networking-k8s
+  docs_url: https://www.gateway-api-controller.eks.aws.dev/
+  last_updated: 2026-04-17
+
+api_stack:
+  translation_model: intermediate
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute (routing only -- `sessionPersistence` field NOT supported)"
+        - "GRPCRoute (routing only -- limited to method+header matching)"
+        - "TLSRoute (TLS passthrough only)"
+      description: |
+        User-facing API. The AWS Gateway API Controller reads HTTPRoute, GRPCRoute, and
+        TLSRoute resources and translates them into VPC Lattice services, listeners, and
+        rules. The upstream `sessionPersistence` field on HTTPRoute rules is NOT supported
+        because VPC Lattice has no session persistence capability at the dataplane level.
+    - name: AWS Custom CRDs
+      type: intermediate
+      resources:
+        - "TargetGroupPolicy (application-networking.k8s.aws/v1alpha1)"
+        - "IAMAuthPolicy (application-networking.k8s.aws/v1alpha1)"
+        - "AccessLogPolicy (application-networking.k8s.aws/v1alpha1)"
+        - "VpcAssociationPolicy (application-networking.k8s.aws/v1alpha1)"
+      description: |
+        AWS-specific CRDs for configuring VPC Lattice target group settings, IAM-based
+        auth policies, access logging, and VPC association. `TargetGroupPolicy` allows
+        configuring protocol, protocol version, and health check settings on target
+        groups. NONE of these CRDs provide session persistence or session affinity
+        configuration -- this is because VPC Lattice itself does not support sticky
+        sessions at the infrastructure level.
+    - name: AWS VPC Lattice
+      type: dataplane
+      resources:
+        - "VPC Lattice Service Network (maps from Gateway)"
+        - "VPC Lattice Service (maps from HTTPRoute/GRPCRoute)"
+        - "VPC Lattice Listener (protocol + port)"
+        - "VPC Lattice Listener Rule (path/header matching, weighted routing)"
+        - "VPC Lattice Target Group (round-robin only, no stickiness)"
+      description: |
+        The actual AWS VPC Lattice managed infrastructure. VPC Lattice is a fully managed
+        application networking service that provides service-to-service connectivity,
+        security, and monitoring. VPC Lattice does NOT support session persistence, sticky
+        sessions, or any form of session affinity on target groups. The only routing
+        algorithm is round-robin. VPC Lattice does support AZ affinity (routing to targets
+        in the same Availability Zone as the client), but this is infrastructure-level
+        locality optimization, not session-level persistence.
+
+native_profile:
+  overview: |
+    Amazon Elastic Kubernetes Service (EKS) implements Gateway API using the AWS Gateway API
+    Controller (`application-networking.k8s.aws/gateway-api-controller`) which provisions and
+    configures Amazon VPC Lattice as the dataplane. Unlike in-cluster proxy implementations
+    (Envoy Gateway, Istio, NGINX), the load balancing infrastructure is fully managed by AWS --
+    users do not deploy or manage proxy Pods.
+
+    **CRITICAL: VPC Lattice does NOT support session persistence, sticky sessions, or any form
+    of session affinity.** This is a fundamental architectural limitation of the VPC Lattice
+    dataplane. VPC Lattice target groups only support round-robin routing. There is no cookie-based
+    stickiness, no source-IP affinity, no header-based affinity, and no session persistence
+    mechanism of any kind.
+
+    This stands in stark contrast to AWS's own Application Load Balancer (ALB), which supports
+    both duration-based cookies (LB-generated `AWSALB` cookie) and application-based cookies
+    for sticky sessions. However, VPC Lattice is a different product with different design goals
+    -- it is focused on service-to-service (east-west) communication where stateless patterns
+    are the norm.
+
+    The AWS Gateway API Controller provides custom CRDs (`TargetGroupPolicy`, `IAMAuthPolicy`,
+    `AccessLogPolicy`, `VpcAssociationPolicy`) for VPC Lattice-specific configuration, but
+    NONE of these CRDs include session persistence fields because VPC Lattice does not support
+    the feature.
+
+    VPC Lattice does support AZ affinity: when a client sends a request, VPC Lattice responds
+    with an IP address from the same Availability Zone as the client. This is transparent
+    infrastructure-level routing optimization, not session persistence. If the AZ is unavailable,
+    VPC Lattice falls back to other AZs.
+
+    **idleTimeout: NOT APPLICABLE.** VPC Lattice has a fixed idle connection timeout of 1 minute
+    and a fixed overall connection timeout of 10 minutes. These are connection-level timeouts
+    (not session affinity timeouts) and are NOT configurable. Since there is no session
+    persistence at all, there is no session idle timeout concept.
+
+  mechanisms: []
+    # VPC Lattice has NO session persistence mechanisms.
+    # No cookie-based stickiness, no source-IP affinity, no header-based affinity.
+    # The only routing algorithm is round-robin.
+
+  attachment_points: []
+    # No session persistence mechanisms exist, so there are no attachment points.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: null
+      label: "not implementable (VPC Lattice has no session persistence capability)"
+      dataplane_target:
+        name: "none -- VPC Lattice does not support session persistence"
+        label: "not supported"
+    btp:
+      target_layer: null
+      label: "not implementable (VPC Lattice has no session persistence capability)"
+      dataplane_target:
+        name: "none -- VPC Lattice does not support session persistence"
+        label: "not supported"
+
+  dataplane_translation:
+    description: |
+      The AWS Gateway API Controller translates Gateway API resources into VPC Lattice API
+      calls. The controller is open-source (github.com/aws/aws-application-networking-k8s).
+
+      Translation flow:
+
+      1. Gateway -> VPC Lattice Service Network
+         - A Gateway with GatewayClass `amazon-vpc-lattice` maps to a VPC Lattice
+           service network. Each Gateway does NOT create a single entrypoint -- instead,
+           each Route under the Gateway gets its own domain name.
+
+      2. HTTPRoute/GRPCRoute -> VPC Lattice Service + Listener + Rules
+         - Each HTTPRoute creates a VPC Lattice service with listener(s) and rules.
+         - Path-based and header-based matching map to VPC Lattice listener rules.
+         - Weighted backend references map to weighted target group actions.
+         - Backend Kubernetes Services map to VPC Lattice target groups.
+         - Pods are registered as targets in the target groups.
+
+      3. TargetGroupPolicy -> VPC Lattice Target Group Configuration
+         - Protocol (HTTP/HTTPS/TCP), protocol version (HTTP1/HTTP2/gRPC),
+           and health check settings are configured via TargetGroupPolicy CRD.
+
+      There is NO translation path for session persistence because VPC Lattice's
+      `CreateTargetGroup` and `UpdateTargetGroup` APIs do not accept any stickiness,
+      session, or affinity parameters. The VPC Lattice `TargetGroupConfig` structure
+      only supports: `healthCheck`, `ipAddressType`, `lambdaEventStructureVersion`,
+      `port`, `protocol`, `protocolVersion`, and `vpcIdentifier`.
+    envoy_features_used:
+      - "N/A -- VPC Lattice is a fully managed AWS service, not Envoy-based"
+      - "VPC Lattice Service Network (from Gateway)"
+      - "VPC Lattice Service + Listener + Rules (from HTTPRoute/GRPCRoute)"
+      - "VPC Lattice Target Group (from backend Service references)"
+    key_code_paths:
+      - "github.com/aws/aws-application-networking-k8s -- open-source controller"
+      - "VPC Lattice API: CreateTargetGroup, UpdateTargetGroup, CreateService, CreateListener, CreateRule"
+      - "Controller CRDs: TargetGroupPolicy, IAMAuthPolicy, AccessLogPolicy, VpcAssociationPolicy"
+    flow: |
+      Gateway API -> VPC Lattice (no session persistence path exists):
+
+        GatewayClass: amazon-vpc-lattice
+          controllerName: application-networking.k8s.aws/gateway-api-controller
+
+        Gateway
+          -> VPC Lattice Service Network
+
+        HTTPRoute
+          -> VPC Lattice Service {
+               listeners: [{ protocol, port }]
+               rules: [{ match: { path, headers }, action: { targetGroups with weights } }]
+             }
+
+        Service (backendRef)
+          -> VPC Lattice Target Group {
+               type: IP
+               config: { protocol, protocolVersion, port, healthCheck, vpcIdentifier }
+               // NO stickiness, session, or affinity fields exist in the API
+             }
+          -> Pods registered as Targets
+
+        TargetGroupPolicy CRD
+          -> Target Group config: { protocol, protocolVersion, healthCheck }
+
+        sessionPersistence field on HTTPRoute
+          -> NOT SUPPORTED -- no VPC Lattice API to translate to
+
+  capabilities:
+    cookie_persistence: false   # VPC Lattice has no cookie-based stickiness
+    header_persistence: false   # VPC Lattice has no header-based affinity
+    source_ip_affinity: false   # VPC Lattice has no source IP affinity (AZ affinity is not the same thing)
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: false
+      path: false
+      domain: false
+      ttl: false
+      secure: false
+      http_only: false
+      same_site: false
+    idle_timeout: false    # VPC Lattice has a fixed 1-minute idle CONNECTION timeout, but no session affinity idle timeout (session persistence does not exist)
+    absolute_timeout: false  # No session persistence exists, so no absolute session timeout
+    lifetime_type_session: false
+    lifetime_type_permanent: false
+
+  limitations:
+    - "VPC Lattice does NOT support session persistence, sticky sessions, or any form of session affinity -- this is a fundamental dataplane limitation"
+    - "The only routing algorithm is round-robin -- no consistent hashing, no ring hash, no maglev"
+    - "VPC Lattice has a fixed idle connection timeout of 1 minute -- NOT configurable"
+    - "VPC Lattice has a fixed overall connection timeout of 10 minutes -- NOT configurable"
+    - "No cookie-based stickiness (unlike AWS ALB which supports `AWSALB` duration-based cookies and application-based cookies)"
+    - "No source-IP affinity (unlike AWS NLB which supports source IP stickiness)"
+    - "No header-based session affinity"
+    - "VPC Lattice is primarily for east-west (service-to-service) traffic, not internet-facing ingress"
+    - "No WebSocket support"
+    - "No AWS WAF integration"
+    - "Gateway API conformance status is 'Stale' -- only 10 core tests passed with 23 skipped in the GATEWAY-HTTP profile"
+    - "GRPCRoute has limitations: no ServiceExport integration, only one method match per rule, max 5 header matches per rule"
+    - "TLSRoute supports only TLS passthrough (`Terminate` mode); certificates cannot be provided via `certificateRefs` Secret (must use ACM ARN in `options` field)"
+    - "Single VPC Lattice service network per VPC -- cannot associate a VPC with multiple service networks"
+    - "Regional only -- no cross-region support (requires Transit Gateway for inter-region connectivity)"
+    - "Each HTTPRoute creates its own domain name -- no shared entrypoint like a traditional load balancer"
+    - "AZ affinity (routing to same AZ as client) is automatic and transparent, but is NOT session persistence"
+
+  known_issues:
+    - url: "https://github.com/aws/aws-application-networking-k8s/issues/644"
+      description: "Single VPC Lattice Service with multiple listeners -- each Route creates its own service, limiting listener flexibility."
+    - url: "https://github.com/aws/aws-application-networking-k8s/issues/282"
+      description: "HTTPRoute status update triggered indefinitely due to timestamp-based condition updates."
+    - url: "https://github.com/aws/aws-application-networking-k8s/issues/663"
+      description: "Unable to configure Gateway API with AWS VPC Lattice using gateway-api-controller."
+
+gwapi_assessment:
+  overview: |
+    Amazon EKS (via the AWS Gateway API Controller and VPC Lattice) CANNOT support Gateway API's
+    `sessionPersistence` field on HTTPRoute rules or `BackendLBPolicy`. This is not a controller
+    limitation -- it is a fundamental dataplane limitation. VPC Lattice, the underlying managed
+    infrastructure, has NO session persistence, sticky sessions, or session affinity capability
+    of any kind.
+
+    The VPC Lattice `CreateTargetGroup` and `UpdateTargetGroup` APIs do not include any stickiness,
+    session, or affinity parameters. The only routing algorithm is round-robin. There is no
+    cookie-based persistence, no source-IP affinity, no header-based affinity, and no consistent
+    hashing. VPC Lattice is designed for stateless service-to-service communication.
+
+    This means implementing Gateway API `sessionPersistence` would require AWS to add session
+    persistence as a new feature to the VPC Lattice service itself -- this is a cloud infrastructure
+    change, not a controller code change. The AWS Gateway API Controller is open-source, but it
+    cannot implement features that do not exist in the underlying VPC Lattice API.
+
+    **idleTimeout: NOT SUPPORTED and CANNOT BE SUPPORTED** without VPC Lattice dataplane changes.
+    VPC Lattice has a fixed 1-minute idle connection timeout and a fixed 10-minute overall
+    connection timeout. These are connection-level timeouts, not session affinity timeouts.
+    Even if VPC Lattice added session persistence, it is unclear whether idle timeout for session
+    affinity would be included, as AWS ALB's sticky sessions also do not support idle-based
+    session timeout (only duration-based cookie TTL).
+
+    The conformance report for v2.0.1 (Gateway API v1.4.0, experimental channel) shows partial
+    conformance with only 10 core tests passed and 23 skipped in the GATEWAY-HTTP profile. Many
+    fundamental tests are skipped including HTTPRouteSimpleSameNamespace, HTTPRouteHeaderMatching,
+    HTTPRouteWeight, HTTPRouteRequestHeaderModifier, and all TLS/ReferenceGrant tests.
+
+    AWS offers an alternative for users who need sticky sessions: the AWS Load Balancer Controller
+    (`aws-alb-gateway-class`) which provisions ALBs with full sticky session support. The
+    recommended pattern is to use AWS Load Balancer Controller for internet-facing services
+    requiring sticky sessions and VPC Lattice for internal service-to-service communication.
+
+  route_inline:
+    difficulty: requires_dataplane_changes
+    description: |
+      Implementing `sessionPersistence` on HTTPRoute rules is IMPOSSIBLE with the current VPC
+      Lattice dataplane. VPC Lattice has no session persistence mechanism -- no cookies, no
+      source IP affinity, no header-based affinity, no consistent hashing.
+
+      This requires AWS to add session persistence as a feature to VPC Lattice itself:
+      1. VPC Lattice API would need new parameters (e.g., stickiness type, cookie TTL,
+         duration) on target groups or listener rules
+      2. VPC Lattice infrastructure would need to implement cookie generation, session
+         tracking, and affinity routing
+      3. The AWS Gateway API Controller would then need to translate `sessionPersistence`
+         to the new VPC Lattice API parameters
+
+      This is a cloud infrastructure feature request, not a controller code change.
+    mapping_strategy: |
+      No mapping strategy is possible because VPC Lattice has no session persistence API.
+
+      If AWS were to add session persistence to VPC Lattice (hypothetically):
+      - `type: Cookie` -> VPC Lattice target group stickiness (similar to ALB `lb_cookie`)
+      - `type: Header` -> Would need new VPC Lattice header-based affinity feature
+      - `sessionName` -> Cookie name configuration
+      - `absoluteTimeout` -> Cookie duration/TTL
+      - `idleTimeout` -> Likely no equivalent (AWS ALB also does not support idle-based session timeout)
+      - `cookieConfig.lifetimeType: Session` -> Session cookie (no Expires)
+      - `cookieConfig.lifetimeType: Permanent` -> Persistent cookie with TTL
+
+      Workaround: Use an ALB as a target type within VPC Lattice, and enable sticky
+      sessions on the ALB's target group. This introduces additional infrastructure
+      complexity and cost.
+    gotchas:
+      - "VPC Lattice fundamentally does not support session persistence -- this is a dataplane limitation, not a controller limitation"
+      - "The AWS Gateway API Controller is open-source, but adding session persistence requires changes to the proprietary VPC Lattice service"
+      - "AWS ALB supports sticky sessions but is a different GatewayClass (`aws-alb-gateway-class`), not VPC Lattice"
+      - "Even if VPC Lattice added sticky sessions, `idleTimeout` would likely not be supported (AWS ALB also lacks idle-based session timeout)"
+      - "VPC Lattice has a fixed 1-minute idle connection timeout -- this is a connection timeout, not a session affinity timeout"
+      - "VPC Lattice is designed for stateless east-west traffic -- session persistence is contrary to its design philosophy"
+    code_changes_needed:
+      - "AWS VPC Lattice service itself needs session persistence feature (cloud infrastructure change by AWS)"
+      - "VPC Lattice API (`CreateTargetGroup`, `UpdateTargetGroup`) needs stickiness parameters"
+      - "VPC Lattice infrastructure needs cookie generation, session tracking, and affinity routing"
+      - "AWS Gateway API Controller needs translation logic from `sessionPersistence` to new VPC Lattice API parameters"
+      - "TargetGroupPolicy CRD may need new fields for session persistence configuration"
+
+  backend_traffic_policy:
+    difficulty: requires_dataplane_changes
+    description: |
+      Implementing `BackendLBPolicy` with `sessionPersistence` is equally impossible with the
+      current VPC Lattice dataplane. The same fundamental limitation applies: VPC Lattice target
+      groups do not support stickiness.
+
+      The TargetGroupPolicy CRD (which is conceptually similar to BackendLBPolicy) only supports
+      protocol, protocol version, and health check configuration. It does not include any session
+      persistence fields because VPC Lattice has no such capability.
+
+      AWS would need to:
+      1. Add session persistence to VPC Lattice target groups
+      2. Update the TargetGroupPolicy CRD or create a new BackendLBPolicy CRD
+      3. Implement translation from the CRD to VPC Lattice API
+    mapping_strategy: |
+      No mapping strategy is possible with current VPC Lattice capabilities.
+
+      If VPC Lattice added session persistence (hypothetically):
+      - BackendLBPolicy targeting a Service -> TargetGroupPolicy with stickiness config
+      - `sessionPersistence` fields -> VPC Lattice target group stickiness parameters
+      - Could potentially extend the existing TargetGroupPolicy CRD with stickiness fields
+    gotchas:
+      - "TargetGroupPolicy CRD exists but has no session persistence fields"
+      - "VPC Lattice target group API has no stickiness parameters"
+      - "Requires AWS cloud infrastructure changes, not just controller changes"
+    code_changes_needed:
+      - "VPC Lattice service needs session persistence feature (cloud infrastructure change)"
+      - "TargetGroupPolicy CRD or new BackendLBPolicy CRD needs session persistence fields"
+      - "Controller needs translation from CRD to VPC Lattice stickiness API"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: |
+        VPC Lattice does NOT support cookie-based session persistence. There is no cookie
+        generation, no cookie-based routing, and no stickiness configuration in the VPC
+        Lattice API. AWS ALB supports cookie-based stickiness (`AWSALB` duration-based
+        cookie and application-based cookies), but ALB is a different product/GatewayClass.
+    - gwapi_field: "type: Header"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: |
+        VPC Lattice does NOT support header-based session affinity. VPC Lattice supports
+        header-based ROUTING (matching requests by header values in listener rules), but
+        this is path/header matching for routing decisions, not session affinity that pins
+        a client to a specific backend based on a header value.
+    - gwapi_field: "sessionName"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "No session persistence exists, so there is no session name concept."
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "No cookie persistence exists in VPC Lattice."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "No cookie persistence exists in VPC Lattice."
+    - gwapi_field: "absoluteTimeout"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: |
+        VPC Lattice has fixed connection timeouts (1-minute idle, 10-minute overall), but
+        these are connection-level timeouts, not session affinity timeouts. There is no
+        session persistence, so there is no session timeout of any kind.
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: |
+        NOT SUPPORTED. VPC Lattice has no session persistence, so there is no session idle
+        timeout. VPC Lattice does have a fixed 1-minute idle CONNECTION timeout, but this
+        is a connection-level timeout that closes idle TCP connections -- it is NOT a session
+        affinity idle timeout. This 1-minute idle connection timeout is fixed and not
+        configurable. Even if VPC Lattice added session persistence, idle timeout for
+        session affinity would likely not be included, as AWS ALB's sticky sessions also
+        only support duration-based cookie TTL, not idle-based session timeout.
+    - gwapi_field: "cookie path (computed)"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "No cookie persistence exists in VPC Lattice."
+
+  deviations:
+    - "VPC Lattice fundamentally does NOT support session persistence -- this is not a controller gap but a dataplane limitation"
+    - "The only routing algorithm is round-robin with AZ affinity -- no consistent hashing, ring hash, or maglev"
+    - "VPC Lattice is designed for stateless service-to-service (east-west) communication, not stateful session handling"
+    - "AWS offers sticky sessions via ALB (different GatewayClass: `aws-alb-gateway-class`) but not via VPC Lattice"
+    - "VPC Lattice target groups have no stickiness API parameters -- the `CreateTargetGroup` API only accepts protocol, port, health check, and VPC configuration"
+    - "Gateway API conformance is 'Stale' with only 10/33 core tests passing -- many basic features are not yet fully conformant"
+    - "VPC Lattice's fixed 1-minute idle timeout and 10-minute connection timeout are connection-level, not session-level"
+    - "Each HTTPRoute creates a separate VPC Lattice service with its own domain name -- no shared ingress endpoint"
+    - "TLS certificate management requires ACM ARN annotation, not Kubernetes Secret via `certificateRefs`"
+    - "The AWS Gateway API Controller is open-source, but VPC Lattice itself is proprietary AWS infrastructure"
+    - "No `BackendLBPolicy` support exists; `TargetGroupPolicy` is the closest CRD but only covers protocol/health settings"
+
+  overall_difficulty: requires_dataplane_changes
+  summary: |
+    Amazon EKS with VPC Lattice presents the most extreme case among Gateway API implementations
+    for session persistence (GEP-1619): **the dataplane fundamentally does not support session
+    persistence of any kind**. This is not a controller limitation or a configuration gap --
+    VPC Lattice, the underlying AWS managed service, has no session persistence, sticky sessions,
+    or session affinity capability whatsoever.
+
+    Key findings:
+
+    (1) **No session persistence at all.** VPC Lattice target groups only support round-robin
+        routing. There is no cookie-based stickiness, no source-IP affinity, no header-based
+        affinity, and no consistent hashing. The VPC Lattice `CreateTargetGroup` API does not
+        accept any stickiness parameters. This contrasts sharply with AWS ALB, which supports
+        both duration-based and application-based sticky sessions.
+
+    (2) **idleTimeout is NOT SUPPORTED and CANNOT be supported** without VPC Lattice
+        infrastructure changes. VPC Lattice has a fixed 1-minute idle connection timeout and
+        a fixed 10-minute overall connection timeout, but these are connection-level timeouts,
+        not session affinity timeouts. Since there is no session persistence at all, the concept
+        of a session idle timeout does not apply.
+
+    (3) **Requires cloud infrastructure changes.** Implementing Gateway API `sessionPersistence`
+        would require AWS to add session persistence as a new feature to the VPC Lattice
+        service itself. This is a cloud infrastructure change, not a controller code change.
+        The AWS Gateway API Controller is open-source, but it cannot implement features that
+        do not exist in the underlying VPC Lattice API.
+
+    (4) **Gateway API conformance is stale.** The v2.0.1 conformance report (Gateway API v1.4.0,
+        experimental channel) shows only 10 core tests passed with 23 skipped in the GATEWAY-HTTP
+        profile. Many fundamental tests like HTTPRouteSimpleSameNamespace, HTTPRouteHeaderMatching,
+        and HTTPRouteWeight are skipped.
+
+    (5) **AWS provides an alternative.** For users who need sticky sessions, AWS offers the
+        AWS Load Balancer Controller (`aws-alb-gateway-class`) which provisions ALBs with full
+        sticky session support. The recommended pattern is VPC Lattice for internal east-west
+        traffic and ALB for internet-facing services requiring session persistence.
+
+    (6) **Workaround exists but is complex.** Users can place an ALB as a target type within
+        VPC Lattice and enable sticky sessions on the ALB's target group. This adds
+        infrastructure complexity, cost, and latency.
+
+    GatewayClasses provided:
+    - `amazon-vpc-lattice` (controllerName: `application-networking.k8s.aws/gateway-api-controller`)
+      -- provisions VPC Lattice service networks and services
+
+    The overall difficulty is `requires_dataplane_changes` because VPC Lattice itself would need
+    to add session persistence as a new infrastructure feature before the controller could
+    implement Gateway API's `sessionPersistence` field.

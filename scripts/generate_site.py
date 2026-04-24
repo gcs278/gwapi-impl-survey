@@ -769,6 +769,66 @@ def render_detail_diagram(impl: dict) -> str:
     """Implementation-specific detailed architecture diagram (config flow)."""
     name = impl["metadata"]["name"]
 
+    if name == "Amazon EKS":
+        return """graph TB
+    subgraph "User Configuration"
+        GWAPI_RI["HTTPRoute Rule<br/><i>sessionPersistence</i><br/><b>(NOT SUPPORTED)</b>"]
+        GWAPI_BTP["BackendTrafficPolicy<br/><b>(NOT SUPPORTED)</b>"]
+    end
+
+    subgraph "AWS Gateway API Controller"
+        CTRL["aws-application-networking-k8s<br/><i>Translates to VPC Lattice API</i>"]
+    end
+
+    subgraph "AWS VPC Lattice"
+        TG["Target Group<br/><i>Round-robin only<br/>No session persistence<br/>No sticky sessions</i>"]
+    end
+
+    GWAPI_RI -.->|"NOT<br/>SUPPORTED"| CTRL
+    GWAPI_BTP -.->|"NOT<br/>SUPPORTED"| CTRL
+    CTRL --> TG
+
+    classDef notimpl fill:#fff3cd,stroke:#ffc107,stroke-dasharray: 5 5
+    classDef aws fill:#cce5ff,stroke:#004085
+    classDef pipeline fill:#f0f0f0,stroke:#666
+    class GWAPI_RI,GWAPI_BTP notimpl
+    class TG aws
+    class CTRL pipeline"""
+
+    if name == "Kong":
+        return """graph TB
+    subgraph "User Configuration"
+        GWAPI_RI["HTTPRoute Rule<br/><i>sessionPersistence</i><br/><b>(NOT SUPPORTED)</b>"]
+        KUP["KongUpstreamPolicy<br/><i>algorithm: consistent-hashing<br/>hash_on: cookie/header/ip</i>"]
+        KUP_STICKY["KongUpstreamPolicy<br/><i>algorithm: sticky-sessions<br/>(Enterprise only)</i>"]
+        GWAPI_BTP["BackendTrafficPolicy<br/><b>(NOT SUPPORTED)</b>"]
+    end
+
+    subgraph "Kong Ingress Controller"
+        KIC["KIC / Kong Operator<br/><i>Translates to Kong Admin API</i>"]
+    end
+
+    subgraph "Kong Gateway (OpenResty/NGINX + Lua)"
+        UPSTREAM["Upstream<br/><i>hash_on: cookie<br/>hash_on_cookie_path: /</i>"]
+        STICKY["Sticky Sessions<br/><i>Encoded cookie<br/>(Enterprise only)</i>"]
+    end
+
+    GWAPI_RI -.->|"NOT<br/>SUPPORTED"| KIC
+    GWAPI_BTP -.->|"NOT<br/>SUPPORTED"| KIC
+    KUP -->|"consistent hashing"| KIC
+    KUP_STICKY -->|"sticky sessions"| KIC
+    KIC --> UPSTREAM
+    KIC --> STICKY
+
+    classDef notimpl fill:#fff3cd,stroke:#ffc107,stroke-dasharray: 5 5
+    classDef existing fill:#d4edda,stroke:#28a745
+    classDef kong fill:#cce5ff,stroke:#004085
+    classDef pipeline fill:#f0f0f0,stroke:#666
+    class GWAPI_RI,GWAPI_BTP notimpl
+    class KUP,KUP_STICKY existing
+    class UPSTREAM,STICKY kong
+    class KIC pipeline"""
+
     if name == "GKE":
         return """graph TB
     subgraph "User Configuration"
@@ -1214,6 +1274,21 @@ def render_index(impls: list[dict]) -> str:
     impl_list = [i for i in impls if i["metadata"].get("type") != "dataplane_only"]
     dp_list = [i for i in impls if i["metadata"].get("type") == "dataplane_only"]
 
+    # Native API mapping: implementation name → (native API name, is it GWAPI-only?)
+    native_api_map = {
+        "Cilium": ("—", True),
+        "Contour": ("<code>HTTPProxy</code> loadBalancerPolicy", False),
+        "Amazon EKS": ("—", True),
+        "Envoy Gateway": ("—", True),
+        "GKE": ("<code>GCPBackendPolicy</code>, <code>GCPSessionAffinityFilter/Policy</code>", False),
+        "HAProxy Ingress": ("Annotations (<code>session-cookie-*</code>)", False),
+        "Istio": ("<code>DestinationRule</code> consistentHash", False),
+        "kgateway": ("<code>BackendConfigPolicy</code>", False),
+        "Kong": ("<code>KongUpstreamPolicy</code>", False),
+        "NGINX Gateway Fabric": ("—", True),
+        "Traefik": ("<code>IngressRoute</code> / <code>TraefikService</code> sticky", False),
+    }
+
     rows = ""
     for impl in impl_list:
         m = impl["metadata"]
@@ -1221,13 +1296,18 @@ def render_index(impls: list[dict]) -> str:
         ri = ga.get("route_inline", {})
         btp = ga.get("backend_traffic_policy", {})
         np = impl.get("native_profile", {})
-        mechs = ", ".join(mech["name"] for mech in np.get("mechanisms", []))
+        model = impl.get("api_stack", {}).get("translation_model", "")
+        model_badge = f'<span class="badge" style="background:{"#17a2b8" if model == "direct" else "#6f42c1"}">{model}</span>' if model else "—"
+
+        native_api, gwapi_only = native_api_map.get(m["name"], ("—", True))
+        if gwapi_only:
+            native_api = '<span style="color:#888">GWAPI-only</span>'
 
         rows += f"""<tr>
             <td><a href="{impl['_filename']}.html">{m['name']}</a></td>
-            <td>{m.get('type','')}</td>
             <td>{m.get('dataplane','')}</td>
-            <td>{mechs}</td>
+            <td>{model_badge}</td>
+            <td>{native_api}</td>
             <td>{difficulty_badge(ri.get('difficulty',''))}</td>
             <td>{difficulty_badge(btp.get('difficulty',''))}</td>
             <td>{difficulty_badge(ga.get('overall_difficulty',''))}</td>
@@ -1277,11 +1357,11 @@ def render_index(impls: list[dict]) -> str:
             <thead>
                 <tr>
                     <th>Implementation</th>
-                    <th>Type</th>
                     <th>Dataplane</th>
-                    <th>Native Mechanisms</th>
-                    <th>Route-Inline Difficulty</th>
-                    <th>BTP Difficulty</th>
+                    <th>Translation</th>
+                    <th>Native API</th>
+                    <th>Route-Inline</th>
+                    <th>BTP</th>
                     <th>Overall</th>
                 </tr>
             </thead>
@@ -1494,6 +1574,9 @@ def render_ecosystem_page(ecosystem: dict) -> str:
 
 TOPIC_LINKS = [
     ("Cookie Path", "topic-cookie-path.html"),
+    ("Session Name Collisions", "topic-name-collisions.html"),
+    ("Mesh (East-West)", "topic-mesh.html"),
+    ("Route-Inline vs BTP", "topic-route-vs-btp.html"),
 ]
 
 
@@ -2015,10 +2098,10 @@ def wrap_html(title: str, content: str, nav_links: list[tuple[str, str]],
             background: #fffef5;
         }}
         .proposal-card h4 {{ margin-bottom: 8px; }}
-        .proposal-pro-con {{ margin: 12px 0; font-size: 13px; }}
-        .proposal-pro-con .pro::before {{ content: "✓ "; color: #28a745; font-weight: bold; }}
-        .proposal-pro-con .con::before {{ content: "✗ "; color: #dc3545; font-weight: bold; }}
-        .proposal-pro-con p {{ margin: 4px 0; }}
+        .proposal-pro-con {{ margin: 12px 0; font-size: 15px; }}
+        .proposal-pro-con .pro::before {{ content: "✓ "; color: #28a745; font-weight: bold; font-size: 18px; }}
+        .proposal-pro-con .con::before {{ content: "✗ "; color: #dc3545; font-weight: bold; font-size: 18px; }}
+        .proposal-pro-con p {{ margin: 6px 0; }}
         .impl-count {{ font-size: 12px; color: #666; margin-top: 8px; font-style: italic; }}
         .notes-cell {{ font-size: 13px; max-width: 300px; }}
         .topic-link {{
@@ -2438,9 +2521,21 @@ def render_cookie_path_page(impls: list[dict]) -> str:
         else:
             behavior = '<span style="color:#6c757d">N/A</span>'
 
+        # Prior art: did this behavior exist before GEP-1619?
+        gwapi_impls_with_computed = {"Envoy Gateway", "NGINX Gateway Fabric"}
+        if name in gwapi_impls_with_computed and diff == "direct":
+            prior_art = '<span style="color:#888;font-size:12px">Implements GEP-1619 spec</span>'
+        elif diff == "direct":
+            prior_art = '<span style="color:#28a745;font-size:12px">Native prior art</span>'
+        elif diff == "not_supported" and name in ("Contour", "HAProxy Ingress"):
+            prior_art = '<span style="color:#888;font-size:12px">Hardcodes <code>/</code> (pre-dates GEP-1619)</span>'
+        else:
+            prior_art = ""
+
         comp_rows += f"""<tr>
             <td><a href="{impl['_filename']}.html"><strong>{name}</strong></a></td>
             <td>{behavior}</td>
+            <td>{prior_art}</td>
             <td>{badge}</td>
             <td><code>{native}</code></td>
             <td class="notes-cell">{notes}</td>
@@ -2561,24 +2656,108 @@ def render_cookie_path_page(impls: list[dict]) -> str:
                where the cookie path is hardcoded to <code>/</code> with no way to change it.</p>
         </div>
 
-        <h3>How Implementations Handle It Today</h3>
+        <h3>Prior Art: How Cookie Path Was Handled Before GEP-1619</h3>
+        <p>No implementation or dataplane had "compute path from route matches" behavior before GEP-1619.
+           The prior art is either user-configured, hardcoded to <code>/</code>, or omitted entirely.</p>
         <table class="comparison-table">
             <thead><tr>
                 <th>Implementation</th>
-                <th>Cookie Path Behavior</th>
-                <th>Mapping</th>
-                <th>Native Mechanism</th>
-                <th>Notes</th>
+                <th>API</th>
+                <th>Cookie Path</th>
+                <th>Source</th>
             </tr></thead>
-            <tbody>{comp_rows}</tbody>
+            <tbody>
+                <tr>
+                    <td><strong>Istio</strong></td>
+                    <td><code>DestinationRule httpCookie.path</code></td>
+                    <td>User-configured (default: omitted)</td>
+                    <td><a href="https://github.com/istio/istio/blob/master/pilot/pkg/networking/core/route/route.go#L1487" target="_blank">source (L1487)</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Contour</strong></td>
+                    <td><code>HTTPProxy loadBalancerPolicy</code></td>
+                    <td>Hardcoded <code>/</code></td>
+                    <td><a href="https://github.com/projectcontour/contour/blob/main/internal/dag/policy.go#L717" target="_blank">source (L717)</a></td>
+                </tr>
+                <tr>
+                    <td><strong>HAProxy Ingress</strong></td>
+                    <td>Annotations</td>
+                    <td>Hardcoded <code>/</code></td>
+                    <td><a href="https://github.com/jcmoraisjr/haproxy-ingress/blob/master/rootfs/etc/templates/haproxy/haproxy.tmpl#L740" target="_blank">template (L740)</a>;
+                        <a href="https://github.com/jcmoraisjr/haproxy-ingress/issues/528" target="_blank">#528</a> requests it</td>
+                </tr>
+                <tr>
+                    <td><strong>Traefik</strong></td>
+                    <td><code>IngressRoute sticky.cookie</code></td>
+                    <td>User-configured (default: <code>/</code>)</td>
+                    <td><a href="https://github.com/traefik/traefik/blob/master/pkg/server/service/loadbalancer/sticky.go#L58" target="_blank">source (L58)</a></td>
+                </tr>
+                <tr>
+                    <td><strong>GKE</strong></td>
+                    <td><code>GCPTrafficDistributionPolicy</code></td>
+                    <td>User-configured (default: undocumented)</td>
+                    <td><a href="https://cloud.google.com/kubernetes-engine/docs/how-to/configure-gateway-resources#configure_http_cookie-based_session_affinity" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Kong</strong></td>
+                    <td><code>upstream hash_on_cookie_path</code></td>
+                    <td>User-configured (default: <code>/</code>)</td>
+                    <td><a href="https://github.com/Kong/kong/blob/master/kong/db/schema/entities/upstreams.lua#L194" target="_blank">source (L194)</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Amazon EKS</strong></td>
+                    <td>N/A (VPC Lattice)</td>
+                    <td>No session persistence at all</td>
+                    <td><a href="https://docs.aws.amazon.com/vpc-lattice/latest/ug/target-groups.html" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Cilium</strong></td>
+                    <td>N/A</td>
+                    <td>No session persistence at all</td>
+                    <td><a href="https://github.com/cilium/proxy/blob/main/envoy_build_config/extensions_build_config.bzl" target="_blank">build config</a> (stateful_session commented out)</td>
+                </tr>
+                <tr class="cap-group-separator"><td colspan="4"><em>Implements GEP-1619 (computed path built for Gateway API)</em></td></tr>
+                <tr>
+                    <td><strong>Envoy Gateway</strong></td>
+                    <td><code>routePathToCookiePath()</code></td>
+                    <td>Computes from route (GEP-1619)</td>
+                    <td><a href="https://github.com/envoyproxy/gateway" target="_blank">repo</a></td>
+                </tr>
+                <tr>
+                    <td><strong>NGINX Gateway Fabric</strong></td>
+                    <td><code>processSessionPersistenceConfig()</code></td>
+                    <td>Computes from route (GEP-1619)</td>
+                    <td><a href="https://github.com/nginx/nginx-gateway-fabric" target="_blank">repo</a></td>
+                </tr>
+                <tr>
+                    <td><strong>kgateway</strong></td>
+                    <td><code>convertSessionPersistence()</code></td>
+                    <td>Not set (GEP-1619, no path computation)</td>
+                    <td><a href="https://github.com/kgateway-dev/kgateway" target="_blank">repo</a></td>
+                </tr>
+                <tr class="cap-group-separator"><td colspan="4"><em>Dataplanes</em></td></tr>
+                <tr>
+                    <td><strong>NGINX</strong></td>
+                    <td><code>sticky cookie path=</code></td>
+                    <td>User-configured (default: omitted)</td>
+                    <td><a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html#sticky" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>HAProxy</strong></td>
+                    <td><code>cookie</code> directive</td>
+                    <td>Hardcoded <code>/</code></td>
+                    <td><a href="https://docs.haproxy.org/3.0/configuration.html#4-cookie" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Envoy</strong></td>
+                    <td><code>hash_policy cookie.path</code></td>
+                    <td>User-configured (default: omitted)</td>
+                    <td><a href="https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/route/v3/route_components.proto#envoy-v3-api-msg-config-route-v3-routeaction-hashpolicy-cookie" target="_blank">API ref</a></td>
+                </tr>
+            </tbody>
         </table>
-
-        <h4>Dataplane Path Support</h4>
-        <p>Whether the underlying dataplane even supports configuring cookie path:</p>
-        <table class="comparison-table" style="max-width:400px">
-            <thead><tr><th>Dataplane</th><th>Cookie Path Configurable</th></tr></thead>
-            <tbody>{dp_rows}</tbody>
-        </table>
+        <p><strong>Prior art summary:</strong> User-configured (6), Hardcoded <code>/</code> (3), No session persistence (2), Computed from route before GEP-1619 (0).
+           Implementations that compute path today (Envoy Gateway, NGINX Gateway Fabric) built this specifically for GEP-1619.</p>
 
         <h3>The Proposals</h3>
     </div>
@@ -2673,6 +2852,1399 @@ def render_cookie_path_page(impls: list[dict]) -> str:
     </div>"""
 
 
+def render_mesh_topic_page(impls: list[dict]) -> str:
+    """Render a deep-dive topic page on mesh (east-west) session persistence."""
+    impl_list = [i for i in impls if i["metadata"].get("type") != "dataplane_only"]
+
+    # Mesh support survey
+    mesh_data = {
+        "Istio": {"mesh": True, "mesh_sp": "Partial", "notes": "ConsistentHashLB (soft) via DestinationRule. Experimental stateful session via Service label. Gateway API SP not implemented."},
+        "Cilium": {"mesh": True, "mesh_sp": "No", "notes": "L4 source IP affinity via eBPF only. No L7 cookie/header session persistence."},
+        "Contour": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support."},
+        "Envoy Gateway": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support."},
+        "kgateway": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support."},
+        "NGINX Gateway Fabric": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support."},
+        "Traefik": {"mesh": False, "mesh_sp": "No", "notes": "No mesh/GAMMA support."},
+        "HAProxy Ingress": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support."},
+        "Kong": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support."},
+        "GKE": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support via Gateway API."},
+        "Amazon EKS": {"mesh": False, "mesh_sp": "No", "notes": "No mesh support."},
+    }
+
+    mesh_rows = ""
+    for impl in impl_list:
+        name = impl["metadata"]["name"]
+        d = mesh_data.get(name, {"mesh": False, "mesh_sp": "No", "notes": ""})
+        mesh_icon = bool_icon(d["mesh"])
+        sp_val = d["mesh_sp"]
+        if sp_val == "Partial":
+            sp_html = '<span style="color:#ffc107;font-weight:600">Partial</span>'
+        elif sp_val == "No":
+            sp_html = '<span style="color:#dc3545;font-weight:600">No</span>'
+        else:
+            sp_html = '<span style="color:#28a745;font-weight:600">Yes</span>'
+        mesh_rows += f"""<tr>
+            <td><a href="{impl['_filename']}.html"><strong>{name}</strong></a></td>
+            <td class="cap-cell">{mesh_icon}</td>
+            <td class="cap-cell">{sp_html}</td>
+            <td class="notes-cell">{d['notes']}</td>
+        </tr>"""
+
+    # North-south vs east-west diagram
+    ns_ew_diagram = """graph TB
+    subgraph NS["North-South (Ingress)"]
+        direction TB
+        BROWSER["Browser"] -->|"GET /app"| GW["Gateway"]
+        GW -->|"picks 10.0.0.5"| BACKEND_NS["Backend Pod"]
+        BACKEND_NS -->|"200 OK"| GW
+        GW -->|"Set-Cookie: session=encoded-10.0.0.5"| BROWSER
+        BROWSER -->|"Cookie: session=encoded-10.0.0.5<br/>(automatic replay)"| GW
+    end
+
+    subgraph EW["East-West (Mesh / Sidecar)"]
+        direction TB
+        APP_A["Service A App"] -->|"GET /api"| SIDECAR_A["A's Sidecar"]
+        SIDECAR_A -->|"picks 10.0.0.5"| SIDECAR_B["B's Sidecar"]
+        SIDECAR_B --> BACKEND_EW["Service B Pod"]
+        BACKEND_EW --> SIDECAR_B
+        SIDECAR_B -->|"200 OK"| SIDECAR_A
+        SIDECAR_A -->|"Set-Cookie: session=encoded-10.0.0.5"| APP_A
+        APP_A -->|"Cookie: session=encoded-10.0.0.5<br/>(MANUAL replay required)"| SIDECAR_A
+    end
+
+    classDef browser fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef gateway fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef sidecar fill:#fce4ec,stroke:#e91e63,stroke-width:2px
+    classDef backend fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef app fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    class BROWSER,APP_A browser
+    class GW gateway
+    class SIDECAR_A,SIDECAR_B sidecar
+    class BACKEND_NS,BACKEND_EW backend"""
+
+    # Multi-hop problem diagram
+    multihop_diagram = """graph LR
+    APP["Service A"] --> SC_A["A's Sidecar"]
+    SC_A -->|"cookie pins to<br/>waypoint IP"| WP["Waypoint"]
+    WP -->|"picks backend"| SC_B["B's Sidecar"]
+    SC_B --> POD["Service B<br/>Pod 10.0.0.5"]
+
+    SC_A -.->|"Problem: pinned to<br/>waypoint, not backend"| WP
+
+    classDef problem fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+    classDef normal fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    class SC_A,WP problem
+    class APP,SC_B,POD normal"""
+
+    # Per-field analysis
+    field_rows = """
+        <tr>
+            <td><code>type: Cookie</code></td>
+            <td><span style="color:#28a745">Natural</span> (browser cookie jar)</td>
+            <td><span style="color:#dc3545">Problematic</span> (no cookie jar, app must manually extract and replay)</td>
+        </tr>
+        <tr>
+            <td><code>type: Header</code></td>
+            <td>Works, but less common</td>
+            <td><span style="color:#28a745">More natural</span> (maps to gRPC metadata, devs already pass headers)</td>
+        </tr>
+        <tr>
+            <td><code>cookie.name</code></td>
+            <td>Gateway controls it, browser doesn't care</td>
+            <td>Client sidecar controls it. App may need to know it to replay. Costin argues name is
+               pointless since apps should copy all cookies.</td>
+        </tr>
+        <tr>
+            <td><code>cookie.lifetimeType</code></td>
+            <td>Meaningful (browser session vs persistent)</td>
+            <td><span style="color:#dc3545">Mostly meaningless</span>. No "browser session" concept.
+               Costin recommends avoiding persistent cookies for privacy reasons.</td>
+        </tr>
+        <tr>
+            <td><code>absoluteTimeout</code></td>
+            <td>Sets cookie Max-Age/Expires</td>
+            <td>Relevant for proxy-tracked lifetime, but less meaningful as a cookie attribute.</td>
+        </tr>
+        <tr>
+            <td><code>cookie path</code></td>
+            <td>Meaningful (URL path scoping)</td>
+            <td><span style="color:#dc3545">Meaningless</span>. Service-to-service calls are to a DNS name,
+               not path-scoped.</td>
+        </tr>
+        <tr>
+            <td>Secure / HttpOnly / SameSite</td>
+            <td>Important security attributes</td>
+            <td><span style="color:#dc3545">Irrelevant</span>. HttpOnly: no JS. SameSite: no cross-site.
+               Secure: mTLS handles encryption.</td>
+        </tr>"""
+
+    return f"""
+    <div class="content-wrapper">
+        <div class="topic-header">
+            <h2>Mesh (East-West) Session Persistence</h2>
+            <p>How does session persistence work when there's no browser? In service mesh traffic,
+               the fundamental assumptions of cookie-based session persistence break down.</p>
+            <div class="topic-links">
+                <strong>Related:</strong>
+                <a href="https://gateway-api.sigs.k8s.io/geps/gep-1619/#session-persistence-api-with-gamma" target="_blank">GEP-1619 GAMMA section</a> —
+                <a href="https://gateway-api.sigs.k8s.io/mesh/" target="_blank">Gateway API Mesh (GAMMA)</a> —
+                <a href="https://github.com/istio/api/pull/3502" target="_blank">Istio API PR #3502</a> —
+                <a href="https://github.com/grpc/proposal/blob/master/A55-xds-stateful-session-affinity.md" target="_blank">gRPC A55</a>
+            </div>
+        </div>
+
+        <h3>The Core Problem</h3>
+        <p>In north-south traffic, the browser automatically stores and replays cookies. In east-west
+           (mesh) traffic, there's no browser. The calling application must manually extract the
+           session token from the response and include it in subsequent requests. This one difference
+           changes everything about how session persistence works.</p>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{ns_ew_diagram}</pre>
+    </div>
+    <div class="content-wrapper">
+        <div class="callout callout-warning">
+            <strong>Key difference:</strong> In north-south, cookie replay is automatic (browser).
+            In east-west, the application must explicitly extract and replay session tokens. This
+            breaks the mesh transparency promise — the application becomes aware of a proxy concern.
+        </div>
+
+        <h3>How Each GEP-1619 Field Applies to Mesh</h3>
+        <p>Most fields designed for north-south cookie-based persistence have different (or no) meaning
+           in east-west traffic:</p>
+        <table class="comparison-table">
+            <thead><tr>
+                <th>GEP-1619 Field</th>
+                <th>North-South (Ingress)</th>
+                <th>East-West (Mesh)</th>
+            </tr></thead>
+            <tbody>{field_rows}</tbody>
+        </table>
+
+        <h3>The Multi-Hop Problem</h3>
+        <p>In mesh topologies with multiple proxies in the path (sidecar, waypoint, east-west gateway),
+           the client sidecar pins to the <em>next hop</em>, not the final backend. A second session
+           token would be needed at each hop.</p>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{multihop_diagram}</pre>
+    </div>
+    <div class="content-wrapper">
+        <div class="callout callout-info">
+            <p>As discussed in <a href="https://github.com/istio/api/pull/3502" target="_blank">Istio API PR #3502</a>,
+               this is why Istio's Costin Manolache recommends keeping sidecar persistence
+               (DestinationRule) separate from gateway/waypoint persistence (Gateway API). The mechanisms
+               behave differently depending on topology.</p>
+        </div>
+
+        <h3>Producer vs Consumer Routes</h3>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">graph TB
+    subgraph PROD_TITLE["Producer Route: Route in same namespace as Service"]
+        direction TB
+        subgraph FACES_NS1["namespace: faces"]
+            direction TB
+            PR_ROUTE["HTTPRoute: smiley-route<br/><i>sessionPersistence: ...</i>"]
+            PR_SVC["Service: smiley"]
+            PR_ROUTE -.->|"parentRef"| PR_SVC
+        end
+        PR_AFFECT["Affects: ALL callers from ANY namespace"]
+    end
+
+    subgraph CONS_TITLE["Consumer Route: Route in different namespace from Service"]
+        direction TB
+        subgraph FAST_NS["namespace: fast-clients"]
+            CR_ROUTE["HTTPRoute: smiley-route<br/><i>sessionPersistence: ...</i>"]
+        end
+        subgraph FACES_NS2["namespace: faces"]
+            CR_SVC["Service: smiley"]
+        end
+        CR_ROUTE -.->|"parentRef<br/>(cross-namespace)"| CR_SVC
+        CR_AFFECT["Affects: ONLY callers in fast-clients namespace"]
+    end
+
+    classDef ns fill:#f5f5f5,stroke:#999,stroke-width:2px
+    classDef producer fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef consumer fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef svc fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    class FACES_NS1,FACES_NS2,FAST_NS ns
+    classDef affect fill:#fff3cd,stroke:#ffc107,stroke-width:1px,font-size:12px
+    class PR_ROUTE producer
+    class CR_ROUTE consumer
+    class PR_SVC,CR_SVC svc
+    class PR_AFFECT,CR_AFFECT affect</pre>
+    </div>
+    <div class="content-wrapper">
+        <div class="callout callout-info">
+            <p>Session persistence is always the same mechanism (proxy pins client to backend).
+               Producer vs consumer just determines the scope: producer applies it to all traffic
+               reaching the service, consumer applies it only to traffic from a specific namespace.</p>
+        </div>
+        <p>In Gateway API mesh (GAMMA), routes are either
+           <a href="https://gateway-api.sigs.k8s.io/mesh/#producer-routes" target="_blank">producer</a> or
+           <a href="https://gateway-api.sigs.k8s.io/mesh/#consumer-routes" target="_blank">consumer</a>
+           routes. This distinction matters for session persistence because it determines who configures
+           it and who is affected.</p>
+        <table class="comparison-table">
+            <thead><tr>
+                <th></th>
+                <th>Producer Route</th>
+                <th>Consumer Route</th>
+            </tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>Definition</strong></td>
+                    <td>Route in the <strong>same namespace</strong> as the Service</td>
+                    <td>Route in a <strong>different namespace</strong> from the Service</td>
+                </tr>
+                <tr>
+                    <td><strong>Created by</strong></td>
+                    <td>Service owner</td>
+                    <td>Caller / consumer of the service</td>
+                </tr>
+                <tr>
+                    <td><strong>Affects</strong></td>
+                    <td>All traffic to the Service, from any namespace</td>
+                    <td>Only traffic from the consumer's namespace</td>
+                </tr>
+                <tr>
+                    <td><strong>N-S equivalent</strong></td>
+                    <td>BackendTrafficPolicy</td>
+                    <td>Route-inline <code>sessionPersistence</code></td>
+                </tr>
+                <tr>
+                    <td><strong>SP use case</strong></td>
+                    <td>"All clients calling my service should get persistent sessions"</td>
+                    <td>"My service's calls to this backend should be persistent"</td>
+                </tr>
+            </tbody>
+        </table>
+        <p>Session persistence is always enforced on the <strong>consumer side</strong> (the proxy closest
+           to the caller). Whether configured by a producer route or consumer route, it's the calling
+           proxy (gateway, sidecar, or waypoint) that reads the session token and pins to a backend.
+           The backend is unaware that persistence is happening.</p>
+        <div class="callout callout-info">
+            <p>An open question: what happens when a producer route sets <code>sessionPersistence</code>
+               with one configuration and a consumer route in a different namespace sets it with a
+               different configuration for the same Service? This conflict scenario is not yet addressed
+               in GEP-1619.</p>
+        </div>
+
+        <h3>Do We Need Consumer Routes for Session Persistence?</h3>
+        <p>For north-south, consumer-configured persistence (route-inline) makes sense because the
+           route author controls how the gateway handles their traffic. But for mesh, the question is
+           who should be allowed to configure it.</p>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">graph TB
+    subgraph OPTION1["Service Owner Configures (producer-side)"]
+        direction TB
+        subgraph FACES1["namespace: faces"]
+            direction TB
+            BTP["BackendTrafficPolicy<br/><i>sessionPersistence: ...</i>"]
+            PROD_RT["OR Producer HTTPRoute<br/><i>sessionPersistence: ...</i>"]
+            SVC1["Service: smiley"]
+            BTP -.->|"targetRef"| SVC1
+            PROD_RT -.->|"parentRef"| SVC1
+        end
+        ALL1["All callers get persistence"]
+    end
+
+    subgraph OPTION2["Caller Configures (consumer-side)"]
+        direction TB
+        subgraph TEAM_NS["namespace: team-a"]
+            CONS_RT["Consumer HTTPRoute<br/><i>sessionPersistence: ...</i>"]
+        end
+        subgraph FACES2["namespace: faces"]
+            SVC2["Service: smiley"]
+        end
+        CONS_RT -.->|"parentRef<br/>(cross-namespace)"| SVC2
+        ONLY1["Only team-a gets persistence"]
+    end
+
+    classDef owner fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef caller fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef svc fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef ns fill:#f5f5f5,stroke:#999,stroke-width:2px
+    classDef affect fill:#fff3cd,stroke:#ffc107,stroke-width:1px
+    classDef question fill:#fce4ec,stroke:#e91e63,stroke-width:2px
+    class BTP,PROD_RT owner
+    class CONS_RT caller
+    class SVC1,SVC2 svc
+    class FACES1,FACES2,TEAM_NS ns
+    class ALL1,ONLY1 affect</pre>
+    </div>
+    <div class="content-wrapper">
+        <p>A <strong>producer route</strong> with session persistence behaves almost identically to
+           attaching a <strong>BackendTrafficPolicy</strong> to the Service — both say "all traffic to
+           my service gets persistence," and both are configured by the service owner. For mesh,
+           BTP may be the cleaner option since it's already a policy targeting Services without
+           overloading HTTPRoute semantics.</p>
+        <p>A <strong>consumer route</strong> with session persistence means one namespace is configuring
+           persistence for another namespace's service. While there are valid use cases (e.g., a
+           specific caller has a stateful workflow requiring persistence while other callers don't),
+           it raises a boundary concern — should a consumer be able to change how traffic is handled
+           for a service they don't own? For north-south this isn't an issue (the gateway owner
+           controls their own routes), but in mesh it means reaching across namespace boundaries.</p>
+        <div class="callout callout-info">
+            <p>An open question: is BTP + producer routes sufficient for mesh session persistence,
+               or are consumer routes needed too? This affects both the API design and the conflict
+               resolution model.</p>
+        </div>
+
+        <h3>Implementation Survey: Mesh Session Persistence</h3>
+        <p>Which implementations support mesh traffic via Gateway API, and do any support session
+           persistence for east-west?</p>
+        <table class="comparison-table">
+            <thead><tr>
+                <th>Implementation</th>
+                <th>Mesh (GAMMA)</th>
+                <th>Mesh Session Persistence</th>
+                <th>Notes</th>
+            </tr></thead>
+            <tbody>{mesh_rows}</tbody>
+        </table>
+        <p>No implementation supports Gateway API session persistence for mesh traffic today.
+           Istio has partial support via its native DestinationRule API, not through Gateway API.</p>
+
+        <h3>Prior Art</h3>
+        <table class="comparison-table">
+            <thead><tr><th>Implementation</th><th>Mechanism</th><th>Type</th><th>Source</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>Istio ConsistentHashLB</strong></td>
+                    <td>DestinationRule <code>consistentHash.httpCookie</code></td>
+                    <td>Soft affinity (hash-based)</td>
+                    <td><a href="https://istio.io/latest/docs/reference/config/networking/destination-rule/#LoadBalancerSettings-ConsistentHashLB" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Istio Persistent Session</strong></td>
+                    <td>Service label <code>istio.io/persistent-session</code></td>
+                    <td>Strong (stateful_session filter)</td>
+                    <td><a href="https://github.com/istio/istio/issues/39740" target="_blank">issue #39740</a></td>
+                </tr>
+                <tr>
+                    <td><strong>gRPC A55</strong></td>
+                    <td>xDS-based stateful session affinity (proxyless)</td>
+                    <td>Strong (cookie-based, app manages cookie jar)</td>
+                    <td><a href="https://github.com/grpc/proposal/blob/master/A55-xds-stateful-session-affinity.md" target="_blank">proposal</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Linkerd</strong></td>
+                    <td>None</td>
+                    <td>N/A — proxy takes over LB, conflicts with sticky sessions</td>
+                    <td><a href="https://github.com/linkerd/linkerd2/issues/3504" target="_blank">issue #3504</a></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>Open Questions for GEP-1619</h3>
+        <p>GEP-1619's graduation criteria requires
+           <a href="https://gateway-api.sigs.k8s.io/geps/gep-1619/#standard" target="_blank">GAMMA lead sign-off</a>.
+           These questions need answers:</p>
+        <ul>
+            <li>Should mesh-mode routes (parentRef = Service) default to <code>type: Header</code>
+                instead of <code>type: Cookie</code>?</li>
+            <li>Should cookie-specific fields (<code>lifetimeType</code>, <code>path</code>) be documented
+                as irrelevant for mesh?</li>
+            <li>How should multi-hop topologies (sidecar → waypoint → backend) be handled?</li>
+            <li>Should the spec acknowledge that mesh session persistence breaks application
+                transparency?</li>
+            <li>Is header-based persistence sufficient for mesh, or do we need a mesh-specific
+                mechanism?</li>
+        </ul>
+    </div>"""
+
+
+def render_name_collisions_page(impls: list[dict]) -> str:
+    """Render a topic page on session name collision handling."""
+
+    # Collision flow diagram
+    collision_flow = """graph TB
+    USER["User creates two route rules<br/>with same cookie name"]
+
+    USER --> Q1{"Same xRoute or<br/>different xRoutes?"}
+
+    Q1 -->|"Same xRoute"| SAME
+    Q1 -->|"Different xRoutes"| DIFF
+
+    subgraph SAME["Within Same xRoute"]
+        direction TB
+        S1["Option A: CEL rejects at admission"]
+        S2["Option B: First rule wins"]
+        S3["Option C: Allow, let browser sort it out"]
+    end
+
+    subgraph DIFF["Across xRoutes"]
+        direction TB
+        D1["Option A: Oldest route wins, newer PartiallyInvalid"]
+        D2["Option B: Both work independently, risk collision"]
+        D3["Option C: Merge into shared session"]
+    end
+
+    classDef question fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef option fill:#f5f5f5,stroke:#666,stroke-width:1px
+    class Q1 question
+    class S1,S2,S3,D1,D2,D3 option"""
+
+    # Browser behavior diagram
+    browser_diagram = """graph LR
+    subgraph NONOVERLAP["Non-overlapping paths: works"]
+        direction TB
+        R1_NO["Rule 1: /cart<br/>cookie: session=ABC, Path=/cart"]
+        R2_NO["Rule 2: /checkout<br/>cookie: session=XYZ, Path=/checkout"]
+        BROWSER_NO["Browser keeps 2 separate cookies<br/>(different path = different identity)"]
+        R1_NO --> BROWSER_NO
+        R2_NO --> BROWSER_NO
+    end
+
+    subgraph OVERLAP["Overlapping paths: broken"]
+        direction TB
+        R1_OV["Rule 1: /api<br/>cookie: session=ABC, Path=/api"]
+        R2_OV["Rule 2: /api/v2<br/>cookie: session=XYZ, Path=/api/v2"]
+        BROWSER_OV["Request to /api/v2:<br/>Cookie: session=ABC; session=XYZ<br/>Server receives 2 values, undefined behavior"]
+        R1_OV --> BROWSER_OV
+        R2_OV --> BROWSER_OV
+    end
+
+    classDef ok fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef broken fill:#ffebee,stroke:#c62828,stroke-width:2px
+    class R1_NO,R2_NO,BROWSER_NO ok
+    class R1_OV,R2_OV,BROWSER_OV broken"""
+
+    # Prior art table — split into native APIs (prior art) and GWAPI implementations
+    prior_art = """
+                <tr class="cap-group-separator"><td colspan="5"><em>Native APIs (prior art — pre-dates Gateway API session persistence)</em></td></tr>
+                <tr>
+                    <td><strong>Contour</strong></td>
+                    <td><code>HTTPProxy</code></td>
+                    <td>Always collides</td>
+                    <td>Cookie name hardcoded to <code>X-Contour-Session-Affinity</code> with <code>Path=/</code>.
+                        Users cannot configure the name. All routes with cookie affinity share the same
+                        cookie — if two routes target different services, the cookie value gets overwritten
+                        on each navigation. Open request for configurable names
+                        (<a href="https://github.com/projectcontour/contour/issues/2856" target="_blank">#2856</a>,
+                        since 2020).</td>
+                    <td><a href="https://github.com/projectcontour/contour/blob/main/internal/dag/policy.go#L717" target="_blank">source</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Istio</strong></td>
+                    <td><code>DestinationRule</code></td>
+                    <td>No detection</td>
+                    <td>User configures cookie name via <code>httpCookie.name</code>. No validation for
+                        duplicate names across DestinationRules.</td>
+                    <td><a href="https://istio.io/latest/docs/reference/config/networking/destination-rule/#LoadBalancerSettings-ConsistentHashLB" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>HAProxy</strong></td>
+                    <td><code>cookie</code> directive</td>
+                    <td>Structurally prevented</td>
+                    <td>One <code>cookie</code> directive per backend section. Two backends can use the
+                        same cookie name, but HAProxy does not detect this — operator's responsibility.
+                        Docs warn to "choose a name which does not conflict with any likely application cookie."</td>
+                    <td><a href="https://docs.haproxy.org/3.0/configuration.html#4-cookie" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Traefik</strong></td>
+                    <td><code>sticky.cookie</code></td>
+                    <td>Warns in docs</td>
+                    <td>Cookie name is per-service load balancer. With chained WRR, each level needs a distinct
+                        name. Docs recommend unique names; duplicates cause "garbled" cookie values.</td>
+                    <td><a href="https://doc.traefik.io/traefik/routing/services/#sticky-sessions" target="_blank">docs</a></td>
+                </tr>
+                <tr>
+                    <td><strong>Kong</strong></td>
+                    <td><code>KongUpstreamPolicy</code></td>
+                    <td>No detection</td>
+                    <td>Cookie name configured per upstream via <code>hash_on_cookie</code>. No cross-upstream
+                        validation. Two upstreams with same cookie name on same hostname would conflict
+                        in the browser.</td>
+                    <td><a href="https://github.com/Kong/kong/blob/master/kong/db/schema/entities/upstreams.lua#L194" target="_blank">source</a></td>
+                </tr>
+                <tr class="cap-group-separator"><td colspan="5"><em>Gateway API Implementations (implementing GEP-1619 experimental)</em></td></tr>
+                <tr>
+                    <td><strong>Envoy Gateway</strong></td>
+                    <td>GWAPI <code>sessionPersistence</code></td>
+                    <td>No detection</td>
+                    <td>Auto-generates unique names when user omits <code>sessionName</code> (based on
+                        route namespace/name/rule index). When user specifies a name, no cross-rule or
+                        cross-route collision check.</td>
+                    <td><a href="https://github.com/envoyproxy/gateway" target="_blank">repo</a></td>
+                </tr>
+                <tr>
+                    <td><strong>NGINX Gateway Fabric</strong></td>
+                    <td>GWAPI <code>sessionPersistence</code></td>
+                    <td>No detection (planned)</td>
+                    <td>Auto-generates unique key per rule (<code>sp_{routeName}_{ns}_{idx}</code>). No
+                        duplicate detection for user-specified names today. Tracking addition of
+                        <code>PartiallyInvalid</code> rejection.</td>
+                    <td><a href="https://github.com/nginx/nginx-gateway-fabric/issues/4571" target="_blank">#4571</a></td>
+                </tr>
+                <tr>
+                    <td><strong>kgateway</strong></td>
+                    <td>GWAPI <code>sessionPersistence</code></td>
+                    <td>No detection</td>
+                    <td>When user omits name, defaults to static strings (<code>sessionPersistence</code>
+                        for cookies, <code>x-session-persistence</code> for headers). No collision check.
+                        Two rules without explicit names would silently share a name.</td>
+                    <td><a href="https://github.com/kgateway-dev/kgateway" target="_blank">repo</a></td>
+                </tr>"""
+
+    return f"""
+    <div class="content-wrapper">
+        <div class="topic-header">
+            <h2>Session Name Collisions</h2>
+            <p>What happens when two session persistence configurations use the same cookie or header name?
+               This is one of the most complex design questions in GEP-1619, with implications for user
+               experience, implementation complexity, and API portability.</p>
+            <div class="topic-links">
+                <strong>Related:</strong>
+                <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4268" target="_blank">issue #4268</a> —
+                <a href="https://github.com/kubernetes-sigs/gateway-api/pull/4649" target="_blank">PR #4649</a> —
+                <a href="topic-route-vs-btp.html">Route vs BTP</a>
+            </div>
+        </div>
+
+        <h3>The Problem</h3>
+        <p>Session persistence is configured per route rule. Multiple rules can target the same Service.
+           What should happen when two rules use the same cookie name?</p>
+
+        <div class="spec-quote">
+            <p>Two possible interpretations when rules share a session name:</p>
+            <ol>
+                <li><strong>Per-rule scope:</strong> Each rule has its own session, even with the same name.
+                    Client could hit different pods for different paths.</li>
+                <li><strong>Shared scope:</strong> Same name means shared session. Client hits the same pod
+                    for both paths.</li>
+            </ol>
+            <p class="spec-source">— <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4268" target="_blank">issue #4268</a></p>
+        </div>
+
+        <h3>Where Collisions Happen</h3>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{collision_flow}</pre>
+    </div>
+    <div class="content-wrapper">
+
+        <h3>What the Browser Does with Duplicate Cookie Names</h3>
+        <p>Cookie identity in the browser is the tuple <code>(name, domain, path)</code>. Same name with
+           different paths creates separate cookies. Same name with overlapping paths creates
+           undefined behavior per
+           <a href="https://datatracker.ietf.org/doc/html/rfc6265#section-5.4" target="_blank">RFC 6265</a>.</p>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{browser_diagram}</pre>
+    </div>
+    <div class="content-wrapper">
+
+        <h3>Use Cases: Sharing and Conflicts</h3>
+
+        <details><summary><h4>Use Case 1: Intentional Sharing (Route-Inline)</h4></summary>
+        <p>Two route rules with different filters need the user pinned to the same backend pod.</p>
+        <pre style="background:#f5f5f5;padding:16px;border-radius:6px;font-size:13px;margin:12px 0">kind: HTTPRoute
+metadata:
+  name: shop-routes
+spec:
+  hostnames: ["shop.example.com"]
+  rules:
+  - matches:
+    - path: {{"type: PathPrefix, value: /cart"}}
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier: {{"set": [{{"name": "X-Flow", "value": "cart"}}]}}
+    backendRefs: [{{"name": "shop-app"}}]
+    sessionPersistence:
+      type: Cookie
+      cookie: {{"name": "shop-session"}}
+
+  - matches:
+    - path: {{"type: PathPrefix, value: /checkout"}}
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier: {{"set": [{{"name": "X-Flow", "value": "checkout"}}]}}
+    backendRefs: [{{"name": "shop-app"}}]
+    sessionPersistence:
+      type: Cookie
+      cookie: {{"name": "shop-session"}}    # same name as rule 1</pre>
+
+        <div class="mermaid-container" style="width:100%;margin-left:0">
+        <pre class="mermaid">graph LR
+    R1["Rule 1 /cart<br/>cookie = shop-session"] --> SVC["Service shop-app<br/>Pods A, B, C"]
+    R2["Rule 2 /checkout<br/>cookie = shop-session"] --> SVC
+    classDef route fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef svc fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    class R1,R2 route
+    class SVC svc</pre>
+        </div>
+        <p><strong>What happens in the browser (depends on cookie path default):</strong></p>
+        <table class="comparison-table">
+            <thead><tr><th></th><th>If Path=/ (default to /)</th><th>If computed path</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>Step 1</strong></td>
+                    <td>User visits <code>/cart</code> → <code>Set-Cookie: shop-session=pod-A; Path=/</code></td>
+                    <td>User visits <code>/cart</code> → <code>Set-Cookie: shop-session=pod-A; Path=/cart</code></td>
+                </tr>
+                <tr>
+                    <td><strong>Step 2</strong></td>
+                    <td>User visits <code>/checkout</code> → browser sends <code>Cookie: shop-session=pod-A</code>
+                        (<code>Path=/</code> matches) → routes to pod-A</td>
+                    <td>User visits <code>/checkout</code> → browser does NOT send cookie
+                        (<code>Path=/cart</code> doesn't match <code>/checkout</code>)</td>
+                </tr>
+                <tr>
+                    <td><strong>Result</strong></td>
+                    <td><span style="color:#28a745;font-weight:600">Sessions shared.</span>
+                        Same pod for both paths. But configs must match or they'll overwrite each other.</td>
+                    <td><span style="color:#dc3545;font-weight:600">Sessions NOT shared.</span>
+                        Different pods per path despite same cookie name.</td>
+                </tr>
+            </tbody>
+        </table>
+        <div class="callout callout-warning">
+            <p>Whether route-inline sharing works depends entirely on the cookie path default.
+               With <code>Path=/</code>, same name = shared. With computed path, same name = separate cookies.
+               See <a href="topic-cookie-path.html">Cookie Path topic</a>.</p>
+        </div>
+        </details>
+
+        <details><summary><h4>Use Case 2: Intentional Sharing (BTP)</h4></summary>
+        <p>Same goal — different filters, shared session — using BackendTrafficPolicy.</p>
+        <pre style="background:#f5f5f5;padding:16px;border-radius:6px;font-size:13px;margin:12px 0">kind: HTTPRoute
+metadata:
+  name: shop-routes
+spec:
+  hostnames: ["shop.example.com"]
+  rules:
+  - matches:
+    - path: {{"type: PathPrefix, value: /cart"}}
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier: {{"set": [{{"name": "X-Flow", "value": "cart"}}]}}
+    backendRefs: [{{"name": "shop-app"}}]
+    # no sessionPersistence here
+
+  - matches:
+    - path: {{"type: PathPrefix, value: /checkout"}}
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier: {{"set": [{{"name": "X-Flow", "value": "checkout"}}]}}
+    backendRefs: [{{"name": "shop-app"}}]
+    # no sessionPersistence here
+---
+kind: BackendTrafficPolicy
+metadata:
+  name: shop-persistence
+spec:
+  targetRefs: [{{"kind": "Service", "name": "shop-app"}}]
+  sessionPersistence:
+    type: Cookie
+    cookie: {{"name": "shop-session"}}</pre>
+
+        <div class="mermaid-container" style="width:100%;margin-left:0">
+        <pre class="mermaid">graph LR
+    R1B["Rule 1 /cart<br/><i>no persistence</i>"] --> SVCB["Service shop-app<br/>Pods A, B, C"]
+    R2B["Rule 2 /checkout<br/><i>no persistence</i>"] --> SVCB
+    BTPB["BTP<br/>cookie = shop-session"] -.->|"targets"| SVCB
+    classDef route fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef svc fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef btp fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    class R1B,R2B route
+    class SVCB svc
+    class BTPB btp</pre>
+        </div>
+        <p><strong>What happens in the browser:</strong></p>
+        <ol>
+            <li>User visits <code>/cart</code> → Gateway picks pod-A, responds with
+                <code>Set-Cookie: shop-session=pod-A; Path=/</code></li>
+            <li>User visits <code>/checkout</code> → browser sends <code>Cookie: shop-session=pod-A</code>
+                (path <code>/</code> matches everything)</li>
+            <li>Gateway reads cookie, routes to pod-A</li>
+            <li><strong>Result: sessions ARE shared.</strong> User stays on pod-A for both paths.
+                No duplicate names, no conflict resolution needed.</li>
+        </ol>
+        <div class="callout callout-info">
+            <p>BTP shares sessions naturally. One cookie, one config, one Service. Routes stay focused
+               on routing and filters.</p>
+        </div>
+        </details>
+
+        <details><summary><h4>Use Case 3: Accidental Collision (Route-Inline, Path=/)</h4></summary>
+        <p>Two teams independently create routes on the same hostname with the same cookie name.</p>
+        <pre style="background:#f5f5f5;padding:16px;border-radius:6px;font-size:13px;margin:12px 0"># Team A (namespace: team-a)
+kind: HTTPRoute
+metadata:
+  name: admin-route
+  namespace: team-a
+spec:
+  hostnames: ["example.com"]
+  rules:
+  - matches:
+    - path: {{"type: PathPrefix, value: /admin"}}
+    backendRefs: [{{"name": "admin-svc"}}]
+    sessionPersistence:
+      type: Cookie
+      cookie: {{"name": "my-session"}}
+      absoluteTimeout: 1h
+---
+# Team B (namespace: team-b)
+kind: HTTPRoute
+metadata:
+  name: public-route
+  namespace: team-b
+spec:
+  hostnames: ["example.com"]
+  rules:
+  - matches:
+    - path: {{"type: PathPrefix, value: /public"}}
+    backendRefs: [{{"name": "public-svc"}}]
+    sessionPersistence:
+      type: Cookie
+      cookie: {{"name": "my-session"}}    # same name, different timeout
+      absoluteTimeout: 24h</pre>
+
+        <div class="mermaid-container" style="width:100%;margin-left:0">
+        <pre class="mermaid">graph LR
+    subgraph NS_A["namespace team-a"]
+        RA["HTTPRoute admin-route<br/>/admin<br/>cookie = my-session<br/>timeout 1h"]
+        SA["Service admin-svc"]
+        RA --> SA
+    end
+    subgraph NS_B["namespace team-b"]
+        RB["HTTPRoute public-route<br/>/public<br/>cookie = my-session<br/>timeout 24h"]
+        SB["Service public-svc"]
+        RB --> SB
+    end
+    classDef ns fill:#f5f5f5,stroke:#999,stroke-width:2px
+    classDef route fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef svc fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    class NS_A,NS_B ns
+    class RA,RB route
+    class SA,SB svc</pre>
+        </div>
+        <p><strong>What happens in the browser (with <code>Path=/</code>):</strong></p>
+        <ol>
+            <li>User visits <code>/admin</code> → responds with
+                <code>Set-Cookie: my-session=admin-pod-2; Path=/; Max-Age=3600</code></li>
+            <li>User visits <code>/public</code> → browser sends <code>Cookie: my-session=admin-pod-2</code>
+                (<code>Path=/</code> matches everything)</li>
+            <li>Public-svc's persistence logic sees a cookie encoding an admin-svc pod address — undefined behavior</li>
+            <li>Gateway responds with
+                <code>Set-Cookie: my-session=public-pod-1; Path=/; Max-Age=86400</code> — <strong>overwrites</strong> the cookie</li>
+            <li>User goes back to <code>/admin</code> → cookie now points to public-pod-1</li>
+        </ol>
+        <div class="callout callout-warning">
+            <p><strong>Result:</strong> Session hijacking. Each navigation overwrites the other team's cookie.
+               The user bounces between pods in different Services. The timeout alternates between 1h and 24h.
+               Neither team knows the other exists.</p>
+        </div>
+        </details>
+
+        <details><summary><h4>Use Case 4: Config Conflict (Same Route, Same Name, Different Settings)</h4></summary>
+        <p>Two rules in the same HTTPRoute use the same cookie name with different lifetime settings.</p>
+        <pre style="background:#f5f5f5;padding:16px;border-radius:6px;font-size:13px;margin:12px 0">kind: HTTPRoute
+metadata:
+  name: file-routes
+spec:
+  hostnames: ["files.example.com"]
+  rules:
+  - matches:
+    - path: {{"type: PathPrefix, value: /app/upload"}}
+    backendRefs: [{{"name": "file-svc"}}]
+    sessionPersistence:
+      type: Cookie
+      cookie:
+        name: file-session
+        lifetimeType: Permanent
+      absoluteTimeout: 1h
+
+  - matches:
+    - path: {{"type: PathPrefix, value: /app/download"}}
+    backendRefs: [{{"name": "file-svc"}}]
+    sessionPersistence:
+      type: Cookie
+      cookie:
+        name: file-session          # same name
+        lifetimeType: Session       # different lifetime!</pre>
+
+        <div class="mermaid-container" style="width:100%;margin-left:0">
+        <pre class="mermaid">graph LR
+    R4A["Rule 1 /app/upload<br/>cookie = file-session<br/>lifetimeType = Permanent<br/>absoluteTimeout = 1h"] --> SVC4["Service file-svc<br/>Pods A, B, C"]
+    R4B["Rule 2 /app/download<br/>cookie = file-session<br/>lifetimeType = Session"] --> SVC4
+    CONFLICT4["Same cookie name<br/>different lifetime!"]
+    classDef route fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef svc fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef conflict fill:#ffebee,stroke:#c62828,stroke-width:2px
+    class R4A,R4B route
+    class SVC4 svc
+    class CONFLICT4 conflict</pre>
+        </div>
+        <p><strong>What happens in the browser (depends on cookie path default):</strong></p>
+        <table class="comparison-table">
+            <thead><tr><th></th><th>If Path=/ or computed Path=/app</th><th>If computed Path=/app/upload vs /app/download</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>Step 1</strong></td>
+                    <td>User visits <code>/app/upload</code> →
+                        <code>Set-Cookie: file-session=pod-A; Max-Age=3600</code></td>
+                    <td>User visits <code>/app/upload</code> →
+                        <code>Set-Cookie: file-session=pod-A; Path=/app/upload; Max-Age=3600</code></td>
+                </tr>
+                <tr>
+                    <td><strong>Step 2</strong></td>
+                    <td>User visits <code>/app/download</code> → browser sends cookie → routes to pod-A →
+                        response overwrites with <code>Set-Cookie: file-session=pod-A</code> (no Max-Age, session cookie)</td>
+                    <td>User visits <code>/app/download</code> → browser does NOT send cookie →
+                        Gateway picks new pod, sets separate cookie</td>
+                </tr>
+                <tr>
+                    <td><strong>Result</strong></td>
+                    <td><span style="color:#dc3545;font-weight:600">Broken.</span> Cookie lifetime flip-flops
+                        between permanent (1h) and session (deleted on browser close) on every navigation.</td>
+                    <td><span style="color:#ffc107;font-weight:600">Works but misleading.</span> Two separate
+                        cookies despite same name. User may expect shared session.</td>
+                </tr>
+            </tbody>
+        </table>
+        <div class="callout callout-warning">
+            <p>With overlapping or shared paths, different configs on the same cookie name cause the cookie
+               attributes to flip-flop. With non-overlapping computed paths, the configs don't conflict but
+               the sessions aren't shared despite the same name. Neither outcome is what the user intended.</p>
+        </div>
+        </details>
+
+        <details><summary><h4>Use Case 5: BTP Collision (Same Cookie Name, Different Services)</h4></summary>
+        <p>Two BTPs on different Services use the same cookie name on the same hostname.</p>
+        <pre style="background:#f5f5f5;padding:16px;border-radius:6px;font-size:13px;margin:12px 0">kind: BackendTrafficPolicy
+metadata:
+  name: cart-persistence
+spec:
+  targetRefs: [{{"kind": "Service", "name": "cart-svc"}}]
+  sessionPersistence:
+    type: Cookie
+    cookie: {{"name": "my-session"}}
+---
+kind: BackendTrafficPolicy
+metadata:
+  name: account-persistence
+spec:
+  targetRefs: [{{"kind": "Service", "name": "account-svc"}}]
+  sessionPersistence:
+    type: Cookie
+    cookie: {{"name": "my-session"}}    # same name, different service
+---
+kind: HTTPRoute
+spec:
+  hostnames: ["shop.example.com"]
+  rules:
+  - matches:
+    - path: {{"type: PathPrefix, value: /cart"}}
+    backendRefs: [{{"name": "cart-svc"}}]
+  - matches:
+    - path: {{"type: PathPrefix, value: /account"}}
+    backendRefs: [{{"name": "account-svc"}}]</pre>
+
+        <div class="mermaid-container" style="width:100%;margin-left:0">
+        <pre class="mermaid">graph LR
+    RT5["HTTPRoute<br/>/cart and /account"] --> CART["Service cart-svc"]
+    RT5 --> ACCT["Service account-svc"]
+    BTP_CART["BTP<br/>cookie = my-session"] -.->|"targets"| CART
+    BTP_ACCT["BTP<br/>cookie = my-session"] -.->|"targets"| ACCT
+    classDef route fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef svc fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef btp fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    class RT5 route
+    class CART,ACCT svc
+    class BTP_CART,BTP_ACCT btp</pre>
+        </div>
+        <p><strong>What happens in the browser (with <code>Path=/</code>):</strong></p>
+        <ol>
+            <li>User visits <code>/cart</code> → Gateway routes to cart-svc, picks cart-pod-1, responds with
+                <code>Set-Cookie: my-session=cart-pod-1; Path=/</code></li>
+            <li>User visits <code>/account</code> → browser sends <code>Cookie: my-session=cart-pod-1</code>
+                (<code>Path=/</code> matches everything)</li>
+            <li>Gateway routes to account-svc, but the cookie encodes a cart-svc pod address — the
+                persistence logic either ignores it (falls back to LB) or tries to route to cart-pod-1
+                (wrong service)</li>
+            <li>Gateway responds with <code>Set-Cookie: my-session=account-pod-3; Path=/</code> — overwrites</li>
+            <li>User goes back to <code>/cart</code> — cookie now points to account-pod-3</li>
+        </ol>
+        <div class="callout callout-warning">
+            <p><strong>Result:</strong> Same collision pattern as route-inline Use Case 3. Different service
+               owners can still independently pick the same cookie name. However, the collision surface is
+               smaller — BTP has one config per Service, so collisions only happen between Services, not
+               between individual route rules. With route-inline, every rule on every route is a potential
+               collision point.</p>
+        </div>
+        </details>
+
+        <h3>Design Options</h3>
+        <p>Five possible approaches, each with different tradeoffs for users and implementations:</p>
+
+        <table class="comparison-table">
+            <thead><tr>
+                <th>Option</th>
+                <th>Description</th>
+                <th>User Foot Guns</th>
+                <th>Impl Complexity</th>
+                <th>Session Sharing</th>
+            </tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>1. No Validation</strong></td>
+                    <td>Do nothing. Let the browser sort it out.</td>
+                    <td><span style="color:#dc3545">Severe</span> — overlapping paths cause silent session breakage,
+                        RFC 6265 undefined behavior</td>
+                    <td><span style="color:#28a745">None</span></td>
+                    <td>Undefined</td>
+                </tr>
+                <tr>
+                    <td><strong>2. Require Unique Names</strong></td>
+                    <td>Reject duplicate names. CEL within xRoute, oldest-wins across xRoutes.</td>
+                    <td><span style="color:#28a745">Minimal</span> — clear error at admission or via status</td>
+                    <td><span style="color:#ffc107">Moderate</span> — CEL (easy) + cross-route checking (harder)</td>
+                    <td>Not via route-inline. Use BTP or single rule with multiple matches.</td>
+                </tr>
+                <tr>
+                    <td><strong>3. Tuple Conflict Detection</strong></td>
+                    <td>Only reject when <code>(name, domain, path)</code> overlaps.</td>
+                    <td><span style="color:#ffc107">Moderate</span> — complex rules, regex paths can't be checked</td>
+                    <td><span style="color:#dc3545">Very High</span> — path overlap detection, domain computation,
+                        regex handling</td>
+                    <td>Allowed when tuples don't overlap</td>
+                </tr>
+                <tr>
+                    <td><strong>4. Share Sessions</strong></td>
+                    <td>Same name = shared session. Compute LCD path. Merge configs.</td>
+                    <td><span style="color:#dc3545">Severe</span> — action at a distance (adding a route changes
+                        existing route's path), config conflicts</td>
+                    <td><span style="color:#dc3545">High</span> — LCD computation, config merging, conflict detection</td>
+                    <td>Implicit via matching names</td>
+                </tr>
+                <tr>
+                    <td><strong>5. Independent Sessions</strong></td>
+                    <td>Same name creates separate cookies scoped by computed path.</td>
+                    <td><span style="color:#dc3545">Severe</span> — overlapping paths cause RFC 6265 undefined behavior,
+                        user confusion ("same name but not shared?")</td>
+                    <td><span style="color:#28a745">Low</span></td>
+                    <td>No sharing despite same name</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>The "Action at a Distance" Problem (Option 4)</h3>
+        <div class="callout callout-warning">
+            <p><strong>Example:</strong> HTTPRoute 1 exists with path <code>/api/upload</code> and cookie name
+               <code>file-session</code>. Cookie path is <code>/api/upload</code>.</p>
+            <p>User creates HTTPRoute 2 with path <code>/api/download</code> and same cookie name
+               <code>file-session</code>.</p>
+            <p>HTTPRoute 1's cookie path silently changes from <code>/api/upload</code> to <code>/api</code>
+               (longest common denominator). HTTPRoute 1's behavior changed without being modified.</p>
+        </div>
+
+        <h3>The Config Conflict Problem (Option 4)</h3>
+        <div class="callout callout-warning">
+            <p><strong>Example:</strong> Two routes share cookie name <code>shop-session</code>:</p>
+            <pre style="background:#f5f5f5;padding:12px;border-radius:4px;font-size:13px;margin:8px 0">Route A: sessionPersistence.cookie.lifetimeType: Permanent, absoluteTimeout: 1h
+Route B: sessionPersistence.cookie.lifetimeType: Session (no timeout)</pre>
+            <p>Which config wins? The cookie gets overwritten each time the user navigates between
+               paths, alternating between permanent (1h expiry) and session (no expiry).</p>
+        </div>
+
+        <h3>Route-Inline vs BTP: Different Collision Surfaces</h3>
+        <table class="comparison-table">
+            <thead><tr>
+                <th></th>
+                <th>Route-Inline</th>
+                <th>BackendTrafficPolicy</th>
+            </tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>Collision surface</strong></td>
+                    <td>Every rule on every route attached to a Gateway</td>
+                    <td>One config per Service</td>
+                </tr>
+                <tr>
+                    <td><strong>Within-resource duplicates</strong></td>
+                    <td>Possible (multiple rules in same xRoute)</td>
+                    <td>Not possible (one SP config per BTP)</td>
+                </tr>
+                <tr>
+                    <td><strong>Cross-resource duplicates</strong></td>
+                    <td>Likely (multiple routes, multiple teams)</td>
+                    <td>Only when two Services share a hostname</td>
+                </tr>
+                <tr>
+                    <td><strong>Validation needed</strong></td>
+                    <td>CEL (within) + controller (across) + route-vs-BTP precedence</td>
+                    <td>Controller only (across BTPs on same hostname)</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>How Implementations Handle It Today</h3>
+        <p>No implementation currently detects or rejects duplicate session names. The table is split
+           between native APIs (prior art that pre-dates GEP-1619) and Gateway API implementations
+           (which are implementing GEP-1619's experimental design and should not be used to justify
+           the design itself).</p>
+        <table class="comparison-table">
+            <thead><tr>
+                <th>Implementation</th>
+                <th>API</th>
+                <th>Collision Handling</th>
+                <th>Details</th>
+                <th>Source</th>
+            </tr></thead>
+            <tbody>{prior_art}</tbody>
+        </table>
+
+        <h3>The Zhaohuabing Objection</h3>
+        <div class="callout callout-info">
+            <p>The strongest argument against strict uniqueness (Option 2): it prevents legitimate use cases
+               where routes need different filters/policies but shared session affinity to the same backend.
+               For example, <code>/cart</code> and <code>/checkout</code> need different
+               <code>RequestHeaderModifier</code> filters but should pin to the same pod.</p>
+            <p>This can't be solved by merging into one rule (different filters require separate rules).
+               But it <em>can</em> be solved by using BackendTrafficPolicy for the persistence and
+               keeping the routes filter-only.
+               (<a href="https://github.com/kubernetes-sigs/gateway-api/pull/4649" target="_blank">PR #4649 discussion</a>)</p>
+        </div>
+
+        <h3>Open Questions</h3>
+        <ul>
+            <li>Is Option 2 (unique names) too strict? Does the zhaohuabing use case warrant relaxing it?</li>
+            <li>If we allow duplicates, which model — shared (Option 4) or independent (Option 5)?</li>
+            <li>Should the spec define collision behavior, or leave it implementation-specific?</li>
+            <li>Does the collision complexity of route-inline argue for BTP-only session persistence?
+                (see <a href="topic-route-vs-btp.html">Route vs BTP</a>)</li>
+        </ul>
+    </div>"""
+
+
+def render_route_vs_btp_page(impls: list[dict]) -> str:
+    """Render a topic page comparing route-inline vs BTP attachment models."""
+
+    # Prior art survey
+    prior_art_rows = """
+                <tr><td><strong>Contour</strong></td><td>Route</td>
+                    <td><code>HTTPProxy</code> route-level <code>loadBalancerPolicy</code></td></tr>
+                <tr><td><strong>Istio</strong></td><td>Service</td>
+                    <td><code>DestinationRule</code> targets service hostname</td></tr>
+                <tr><td><strong>HAProxy Ingress</strong></td><td>Service</td>
+                    <td>Annotations on Service</td></tr>
+                <tr><td><strong>Kong</strong></td><td>Service</td>
+                    <td><code>KongUpstreamPolicy</code> targets Service</td></tr>
+                <tr><td><strong>Traefik</strong></td><td>Service</td>
+                    <td><code>IngressRoute</code> / <code>TraefikService</code> sticky on service LB</td></tr>
+                <tr><td><strong>Cilium</strong></td><td>Service</td>
+                    <td>Kubernetes Service <code>sessionAffinity</code> (L3/L4)</td></tr>
+                <tr><td><strong>GKE</strong></td><td>Service</td>
+                    <td><code>GCPBackendPolicy</code> targets Service</td></tr>
+                <tr><td><strong>kgateway</strong></td><td>Service</td>
+                    <td><code>BackendConfigPolicy</code> targets Service (for consistent hashing)</td></tr>"""
+
+    # Decision flowchart
+    decision_diagram = """graph TB
+    START["API Design: Do we need both<br/>route-inline AND BTP?"]
+
+    START -->|"Yes, keep both"| BOTH
+    START -->|"No, pick one"| PICK
+
+    subgraph BOTH["Keep Both Attachment Points"]
+        direction TB
+        B1["Must define precedence:<br/>route-inline overrides BTP"]
+        B1 --> B2["Must handle name collisions<br/>across routes + BTPs"]
+        B2 --> B3["Mesh: 3-way precedence<br/>(producer route, consumer route, BTP)"]
+        B3 --> B4{"Restrict mesh to BTP-only?"}
+        B4 -->|"Yes"| B5["Mesh uses BTP.<br/>North-south uses both.<br/>Reduces mesh complexity."]
+        B4 -->|"No"| B6["Full 3-way precedence<br/>needed for mesh."]
+    end
+
+    subgraph PICK["Pick One Attachment Point"]
+        direction TB
+        PICK_Q{"Which one?"}
+        PICK_Q -->|"Route-Inline only"| RI
+        PICK_Q -->|"BTP only"| BTPONLY
+
+        subgraph RI["Route-Inline Only"]
+            direction TB
+            RI1["Per-path scoping available"]
+            RI1 --> RI2["Must solve session sharing<br/>(multi-path to same service)"]
+            RI2 --> RI3["Cookie path computation<br/>needed per route"]
+            RI3 --> RI4["Name collision complexity<br/>across all route rules"]
+            RI4 --> RI5["Mesh: producer + consumer<br/>route precedence needed"]
+        end
+
+        subgraph BTPONLY["BTP Only"]
+            direction TB
+            BTP1["Session sharing works<br/>naturally (per-service)"]
+            BTP1 --> BTP2["No per-path scoping<br/>(use separate Services)"]
+            BTP2 --> BTP3["Cookie path: just use /"]
+            BTP3 --> BTP4["Minimal collision surface<br/>(one config per Service)"]
+            BTP4 --> BTP5["Mesh: clean fit, same<br/>model as north-south"]
+        end
+    end
+
+    classDef start fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef both fill:#fce4ec,stroke:#e91e63,stroke-width:1px
+    classDef pick fill:#f5f5f5,stroke:#999,stroke-width:1px
+    classDef ri fill:#fff3e0,stroke:#ff9800,stroke-width:1px
+    classDef btponly fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px
+    classDef question fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef outcome fill:#f5f5f5,stroke:#666,stroke-width:1px
+    class START start
+    class B1,B2,B3,RI1,RI2,RI3,RI4,RI5,BTP1,BTP2,BTP3,BTP4,BTP5,B5,B6 outcome
+    class B4,PICK_Q question"""
+
+    # Collision diagram
+    collision_diagram = """graph TB
+    subgraph ROUTE_MODEL["Route-Inline: Many configs, wide collision surface"]
+        direction TB
+        HR_A["HTTPRoute A<br/>rule 1: cookie name=my-session<br/>rule 2: cookie name=my-session"]
+        HR_B["HTTPRoute B<br/>rule 1: cookie name=my-session"]
+        HR_C["HTTPRoute C<br/>rule 1: cookie name=my-session"]
+        COLLISION["4 potential collisions<br/>across 3 routes"]
+        HR_A --> COLLISION
+        HR_B --> COLLISION
+        HR_C --> COLLISION
+    end
+
+    subgraph BTP_MODEL["BTP: One config per Service, minimal collisions"]
+        direction TB
+        SVC_A["Service A ← BTP: cookie name=session-a"]
+        SVC_B["Service B ← BTP: cookie name=session-b"]
+        SVC_C["Service C ← BTP: cookie name=session-a"]
+        NO_COLLISION["Only collides if A and C<br/>share a hostname"]
+    end
+
+    classDef route fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    classDef btp fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef warn fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+    classDef ok fill:#d4edda,stroke:#28a745,stroke-width:2px
+    class HR_A,HR_B,HR_C route
+    class SVC_A,SVC_B,SVC_C btp
+    class COLLISION warn
+    class NO_COLLISION ok"""
+
+    return f"""
+    <div class="content-wrapper">
+        <div class="topic-header">
+            <h2>Route-Inline vs BackendTrafficPolicy</h2>
+            <p>Session persistence can be attached at the route rule level (per-path) or at the service
+               level (per-service via BackendTrafficPolicy). This choice affects complexity, portability,
+               session sharing, and mesh support.</p>
+            <div class="topic-links">
+                <strong>Related:</strong>
+                <a href="https://github.com/kubernetes-sigs/gateway-api/discussions/4462" target="_blank">Discussion #4462</a> —
+                <a href="https://github.com/kubernetes-sigs/gateway-api/pull/4649" target="_blank">PR #4649</a> —
+                <a href="topic-mesh.html">Mesh Topic</a>
+            </div>
+        </div>
+
+        <div class="proposals-grid">
+            <div class="proposal-card" style="border-color:#ff9800">
+                <h4>Route-Inline</h4>
+                <p><strong>Session persistence on HTTPRoute rules</strong></p>
+                <div class="proposal-pro-con">
+                    <p class="pro">Per-path scoping (<code>/checkout</code> gets persistence, <code>/browse</code> doesn't)</p>
+                    <p class="pro">Route author controls persistence for their traffic</p>
+                    <p class="pro">More discoverable — lives where users are already configuring routes</p>
+                    <p class="pro">Implementations have converged here — no implementations have shipped BTP yet</p>
+                    <p class="con">Session sharing requires same rule with multiple path matches</p>
+                    <p class="con">Duplicating SP config across multiple routes to the same Service</p>
+                    <p class="con">Name collision complexity across routes (CEL + cross-route conflict resolution)</p>
+                    <p class="con">Same session name creates implicit cross-rule linking,
+                       <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4268#issuecomment-2619834283" target="_blank">inconsistent with API design</a></p>
+                    <p class="con">Cookie path computation needed (no prior art, breaks with edge proxy rewrites)</p>
+                    <p class="con">Cookie scope can be broader than the route,
+                       <a href="https://github.com/kubernetes-sigs/gateway-api/issues/4713#issuecomment-2813977919" target="_blank">affecting other namespaces</a></p>
+                    <p class="con">Mesh: 3-way precedence problem (producer, consumer, BTP)</p>
+                    <p class="con">Prior art: 1 implementation (Contour)</p>
+                </div>
+            </div>
+            <div class="proposal-card" style="border-color:#2e7d32">
+                <h4>BackendTrafficPolicy</h4>
+                <p><strong>Session persistence targeting a Service</strong></p>
+                <div class="proposal-pro-con">
+                    <p class="pro">Session sharing works naturally across all routes to the Service</p>
+                    <p class="pro">Minimal collision surface (one config per Service)</p>
+                    <p class="pro">Cookie path is simply <code>/</code> — no computation, no edge proxy issues</p>
+                    <p class="pro">Clean mesh fit (same model for north-south and east-west)</p>
+                    <p class="pro">Service owner controls scope — safer for multi-tenant
+                       (<a href="https://github.com/kubernetes-sigs/gateway-api/issues/4713#issuecomment-2813977919" target="_blank">ref</a>)</p>
+                    <p class="pro">Cloud implementations (GKE) requested this model</p>
+                    <p class="pro">Istio recommends Gateway API for gateways/waypoints over DestinationRule
+                       (<a href="https://github.com/istio/api/pull/3502" target="_blank">ref</a>)</p>
+                    <p class="pro">Prior art: 7 implementations</p>
+                    <p class="con">No per-path scoping (all-or-nothing per Service)</p>
+                    <p class="con">Per-path needs require separate Services</p>
+                    <p class="con">Discoverability: users must know about a separate resource
+                       (not visible from HTTPRoute alone)</p>
+                    <p class="con">Policy attachment adds implementation complexity
+                       (<a href="https://github.com/kubernetes-sigs/gateway-api/discussions/4462" target="_blank">discussion</a>)</p>
+                    <p class="con">No implementations have shipped BTP session persistence yet</p>
+                </div>
+            </div>
+        </div>
+
+        <h3>The Core Question</h3>
+        <p>Is session persistence a <strong>routing</strong> concern (which path gets persistence) or a
+           <strong>load balancing</strong> concern (how clients reach pods within a service)?</p>
+        <div class="callout callout-info">
+            <p>HTTPRoute decides which <strong>Service</strong> handles a request. Session persistence
+               decides which <strong>Pod</strong> within that Service handles it. These are two different
+               decisions at two different layers.
+               (<a href="https://github.com/kubernetes-sigs/gateway-api/pull/4649#discussion_r2104012685" target="_blank">ref</a>)</p>
+        </div>
+
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">graph TB
+    subgraph RI_MODEL["Route-Inline: One Service concern, fragmented across routes"]
+        direction TB
+        RI_R1["Route Rule /cart<br/>cookie = shop-session<br/>timeout = 1h"]
+        RI_R2["Route Rule /checkout<br/>cookie = shop-session<br/>timeout = 24h"]
+        RI_R3["Route Rule /browse<br/>cookie = other-session"]
+        RI_SVC["Service shop-app<br/>Pods: A, B, C<br/><i>One pod pool, three configs</i>"]
+        RI_R1 -->|"config 1"| RI_SVC
+        RI_R2 -->|"config 2"| RI_SVC
+        RI_R3 -->|"config 3"| RI_SVC
+        RI_CONFLICT["Same pods, conflicting configs.<br/>Which cookie wins?"]
+    end
+
+    subgraph BTP_MODEL2["BTP: One Service, one config"]
+        direction TB
+        BTP_R1["Route Rule /cart<br/>filter X-Flow=cart"]
+        BTP_R2["Route Rule /checkout<br/>filter X-Flow=checkout"]
+        BTP_R3["Route Rule /browse"]
+        BTP_SVC["Service shop-app<br/>Pods: A, B, C"]
+        BTP_POL["BTP<br/>cookie = shop-session<br/>timeout = 1h"]
+        BTP_R1 --> BTP_SVC
+        BTP_R2 --> BTP_SVC
+        BTP_R3 --> BTP_SVC
+        BTP_POL -.->|"one config"| BTP_SVC
+    end
+
+    classDef route fill:#fff3e0,stroke:#ff9800,stroke-width:1px
+    classDef svc fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef btp fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef conflict fill:#ffebee,stroke:#c62828,stroke-width:2px
+    class RI_R1,RI_R2,RI_R3,BTP_R1,BTP_R2,BTP_R3 route
+    class RI_SVC,BTP_SVC svc
+    class BTP_POL btp
+    class RI_CONFLICT conflict</pre>
+    </div>
+    <div class="content-wrapper">
+        <p>Route-inline fragments a single Service's persistence config across multiple route rules, each
+           potentially with different settings — creating room for conflict. BTP keeps it as one config
+           attached to the Service, and routes stay focused on routing and filters.</p>
+
+        <h3>Comparison</h3>
+        <table class="comparison-table">
+            <thead><tr>
+                <th></th>
+                <th>Route-Inline</th>
+                <th>BackendTrafficPolicy</th>
+            </tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>Scope</strong></td>
+                    <td>Per route rule (per-path)</td>
+                    <td>Per Service (all routes to that service)</td>
+                </tr>
+                <tr>
+                    <td><strong>Configured by</strong></td>
+                    <td>Route author</td>
+                    <td>Service owner</td>
+                </tr>
+                <tr>
+                    <td><strong>Session sharing</strong></td>
+                    <td>Only within same rule (multiple path matches)</td>
+                    <td>Automatic across all routes to the Service</td>
+                </tr>
+                <tr>
+                    <td><strong>Name collisions</strong></td>
+                    <td>Many configs → wide collision surface. Needs CEL + cross-route conflict resolution.</td>
+                    <td>One config per Service → minimal collisions.</td>
+                </tr>
+                <tr>
+                    <td><strong>Cookie path</strong></td>
+                    <td>Can be computed from route match (but <a href="topic-cookie-path.html">contentious</a>)</td>
+                    <td>Set to <code>/</code> (simple, no computation needed)</td>
+                </tr>
+                <tr>
+                    <td><strong>Mesh support</strong></td>
+                    <td>Creates 3-way precedence problem (producer route, consumer route, BTP)</td>
+                    <td>Clean fit — one config per service, works same as north-south</td>
+                </tr>
+                <tr>
+                    <td><strong>Complexity</strong></td>
+                    <td>CEL validation, cross-route conflict resolution, cookie path computation,
+                        route-vs-BTP precedence</td>
+                    <td>One config per service, no cross-resource conflicts within scope</td>
+                </tr>
+                <tr>
+                    <td><strong>Flexibility</strong></td>
+                    <td>Different persistence per path (<code>/checkout</code> vs <code>/browse</code>)</td>
+                    <td>All-or-nothing per service (use separate Services for different behavior)</td>
+                </tr>
+                <tr>
+                    <td><strong>Prior art</strong></td>
+                    <td>1 implementation (Contour)</td>
+                    <td>7 implementations</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>Name Collision Surface</h3>
+        <p>The narrower scope of route-inline means more persistence configs, which means more
+           chances for naming collisions:</p>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{collision_diagram}</pre>
+    </div>
+    <div class="content-wrapper">
+
+        <h3>Prior Art</h3>
+        <p>Where do existing implementations (pre-GEP-1619) attach session persistence?</p>
+        <table class="comparison-table">
+            <thead><tr><th>Implementation</th><th>Attaches To</th><th>Mechanism</th></tr></thead>
+            <tbody>{prior_art_rows}</tbody>
+        </table>
+        <p><strong>Prior art:</strong> Service-level (7) vs Route-level (1).</p>
+
+        <h3>API Design Decision Tree</h3>
+        <p>A flowchart for evaluating the attachment model design. Each path shows the
+           consequences and complexity that follow from that choice.</p>
+    </div>
+    <div class="mermaid-container">
+        <pre class="mermaid">{decision_diagram}</pre>
+    </div>
+    <div class="content-wrapper">
+
+        <h3>Open Questions</h3>
+        <ul>
+            <li>Is the per-path scoping of route-inline valuable enough to justify the added complexity
+                (CEL validation, conflict resolution, cookie path computation)?</li>
+            <li>Should session persistence go Standard with both attachment points, or should one be
+                deferred?</li>
+            <li>If both are kept, how should mesh handle the 3-way precedence between producer routes,
+                consumer routes, and BTP?
+                (see <a href="topic-mesh.html">Mesh topic</a>)</li>
+            <li>Can per-path persistence needs be solved by using separate Services instead of
+                route-inline?</li>
+        </ul>
+
+        <div class="callout callout-warning">
+            <p>Active discussion at
+               <a href="https://github.com/kubernetes-sigs/gateway-api/discussions/4462" target="_blank">
+               Discussion #4462</a>.</p>
+        </div>
+    </div>"""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate implementation analysis site")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
@@ -2727,6 +4299,18 @@ def main():
     cookie_path_content = render_cookie_path_page(impls)
     (args.output_dir / "topic-cookie-path.html").write_text(gen_html("Cookie Path", cookie_path_content))
     print(f"Generated: topic-cookie-path.html")
+
+    name_collisions_content = render_name_collisions_page(impls)
+    (args.output_dir / "topic-name-collisions.html").write_text(gen_html("Session Name Collisions", name_collisions_content))
+    print(f"Generated: topic-name-collisions.html")
+
+    mesh_content = render_mesh_topic_page(impls)
+    (args.output_dir / "topic-mesh.html").write_text(gen_html("Mesh (East-West)", mesh_content))
+    print(f"Generated: topic-mesh.html")
+
+    route_btp_content = render_route_vs_btp_page(impls)
+    (args.output_dir / "topic-route-vs-btp.html").write_text(gen_html("Route-Inline vs BTP", route_btp_content))
+    print(f"Generated: topic-route-vs-btp.html")
 
     # Generate per-implementation pages
     for impl in impls:

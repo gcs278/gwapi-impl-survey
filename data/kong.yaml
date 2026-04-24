@@ -1,0 +1,578 @@
+metadata:
+  name: Kong
+  type: integrated
+  dataplane: "Kong (OpenResty/NGINX + Lua)"
+  version_analyzed: "Kong Gateway 3.11+, KIC v3.5+, Kong Operator v2.1.2, April 2026"
+  repo_url: https://github.com/Kong/kubernetes-ingress-controller
+  docs_url: https://developer.konghq.com/kubernetes-ingress-controller/
+  last_updated: 2026-04-17
+
+api_stack:
+  translation_model: direct
+  layers:
+    - name: Gateway API
+      type: gwapi
+      resources:
+        - "HTTPRoute (core conformance, no sessionPersistence support)"
+        - "GRPCRoute (partial conformance)"
+      description: |
+        KIC reads Gateway API resources (HTTPRoute, GRPCRoute, Gateway, etc.) as first-class
+        citizens. However, KIC does NOT read or implement the `sessionPersistence` field on
+        HTTPRoute/GRPCRoute rules. Session persistence is handled exclusively via Kong-specific
+        CRDs (KongUpstreamPolicy).
+    - name: Kong CRDs
+      type: intermediate
+      resources:
+        - "KongUpstreamPolicy (configuration.konghq.com/v1beta1)"
+        - "KongPlugin (configuration.konghq.com/v1)"
+      description: |
+        KongUpstreamPolicy is the primary CRD for session persistence configuration. It
+        configures load balancing algorithm, hash-on strategies, and sticky sessions on
+        Kong Upstream entities. Attached to Kubernetes Services via the
+        `konghq.com/upstream-policy` annotation. Supports two session persistence mechanisms:
+        `consistent-hashing` (soft affinity) and `sticky-sessions` (strong persistence,
+        Kong Enterprise only). KongPlugin can also be used for the Session plugin (authentication
+        session management, separate from load balancing affinity).
+    - name: Kong Gateway Admin API (Upstream entity)
+      type: dataplane
+      resources:
+        - "Upstream.algorithm (sticky-sessions, consistent-hashing)"
+        - "Upstream.hash_on, Upstream.hash_on_cookie, Upstream.hash_on_cookie_path"
+        - "Upstream.hash_fallback, Upstream.hash_fallback_header"
+        - "Upstream.sticky_sessions_cookie, Upstream.sticky_sessions_cookie_path"
+      description: |
+        Kong Gateway's Admin API Upstream entity is the final configuration target. KIC
+        translates KongUpstreamPolicy CRDs into Upstream entity configuration, which Kong
+        Gateway (OpenResty/NGINX + Lua) processes natively. The Upstream entity controls
+        load balancing, hashing, and sticky sessions for traffic to backend Targets.
+
+native_profile:
+  overview: |
+    Kong Gateway is an integrated API gateway built on OpenResty (NGINX + LuaJIT). Kong Ingress
+    Controller (KIC) is the Kubernetes controller that translates Kubernetes resources into Kong
+    Gateway configuration. Kong Operator (KO) is the newer unified operator combining KIC and
+    Kong Gateway Operator functionality.
+
+    Kong provides TWO distinct session persistence mechanisms:
+
+    1. **Sticky Sessions (Strong Persistence)** — Kong Gateway v3.11+ / Kong Enterprise:
+       Uses the `sticky-sessions` load balancing algorithm. Kong sets a browser-managed cookie
+       on the response containing an encoded reference to the backend Target. On subsequent
+       requests, Kong decodes the cookie and routes directly to the same Target, bypassing the
+       load balancer. Cookies are session-scoped (expire when the browser session ends). Kong
+       does NOT store cookie values server-side. Configured via `KongUpstreamPolicy` with
+       `algorithm: sticky-sessions` and `stickySessions.cookie`/`stickySessions.cookiePath`.
+       **Requires Kong Enterprise Gateway.**
+
+    2. **Consistent Hashing (Soft Affinity)** — Kong Gateway OSS and Enterprise:
+       Uses the `consistent-hashing` load balancing algorithm with hash-on strategies (cookie,
+       header, consumer, IP, path, query_arg, uri_capture). When `hash_on=cookie`, Kong
+       generates a cookie with a hash value if one is not present. Requests with the same hash
+       are routed to the same Target, but affinity may be lost when Targets are added/removed.
+       Configured via `KongUpstreamPolicy` with `algorithm: consistent-hashing` and
+       `hashOn.cookie`/`hashOn.cookiePath`.
+
+    Kong does NOT implement the Gateway API `sessionPersistence` field on HTTPRoute/GRPCRoute
+    rules. Session persistence is exclusively configured via Kong-specific CRDs
+    (KongUpstreamPolicy) attached to Kubernetes Services.
+
+    Kong's architecture uses a direct translation pipeline:
+      1. KIC watches Kubernetes resources (Gateway API, KongUpstreamPolicy, etc.)
+      2. `internal/dataplane/translator.Translator` iterates through objects
+      3. `TranslateKongUpstreamPolicy()` converts KongUpstreamPolicy to kong.Upstream
+      4. Configuration is serialized to Kong's declarative config (DB-less mode) or pushed
+         via Admin API
+
+  mechanisms:
+    - name: Sticky Sessions (Strong Persistence)
+      type: strong_persistence
+      description: |
+        Uses Kong Gateway's `sticky-sessions` load balancing algorithm (v3.11+, Enterprise only).
+        Kong sets a cookie on the first response containing an encoded reference to the selected
+        backend Target. On subsequent requests, if the cookie is present and the Target is
+        available, traffic is routed directly to that Target. The cookie does NOT contain a
+        clear direct reference (like hostname or IP) to the upstream target — it uses an
+        encoded representation. Cookies are session-scoped and expire with the browser session.
+        Kong does not store cookie values server-side. If the Target becomes unavailable, a new
+        Target is selected and a new cookie is generated.
+      enabled_by_default: false
+      configuration_method: "KongUpstreamPolicy CRD (configuration.konghq.com/v1beta1) with algorithm: sticky-sessions"
+
+      config_options:
+        - field: algorithm
+          type: "enum (sticky-sessions)"
+          required: true
+          default: null
+          description: "Must be set to `sticky-sessions` to enable sticky session persistence. Requires Kong Enterprise Gateway."
+          support_level: full
+        - field: hashOn.input
+          type: "enum (none)"
+          required: true
+          default: null
+          description: "Must be set to `none` when using sticky-sessions algorithm."
+          support_level: full
+        - field: stickySessions.cookie
+          type: string
+          required: true
+          default: null
+          description: "Name of the cookie used for sticky session tracking. Allowed characters: A-Z, a-z, 0-9, _, -. Periods (.) are not allowed."
+          support_level: full
+        - field: stickySessions.cookiePath
+          type: string
+          required: false
+          default: "/"
+          description: "Path set on the sticky session cookie."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "KongUpstreamPolicy (via konghq.com/upstream-policy annotation on Service)"
+        scope: "per-service (affects all Kong Upstreams created for the Service)"
+
+    - name: Consistent Hashing (Soft Affinity)
+      type: soft_affinity
+      description: |
+        Uses Kong Gateway's `consistent-hashing` load balancing algorithm with configurable
+        hash-on strategies. When `hashOn` is set to `cookie`, Kong generates a cookie if one
+        is not present in the request. Requests with the same hash value are routed to the same
+        Target, but affinity may be lost when Targets are added or removed from the upstream.
+        Available in both Kong OSS and Enterprise.
+      enabled_by_default: false
+      configuration_method: "KongUpstreamPolicy CRD (configuration.konghq.com/v1beta1) with algorithm: consistent-hashing"
+
+      config_options:
+        - field: algorithm
+          type: "enum (consistent-hashing)"
+          required: true
+          default: null
+          description: "Must be set to `consistent-hashing` for hash-based session affinity."
+          support_level: full
+        - field: hashOn.input
+          type: "enum (none, consumer, ip, header, cookie, path, query_arg, uri_capture)"
+          required: false
+          default: null
+          description: "Defines what to use as hashing input. Only one of input, cookie, header, uriCapture, or queryArg can be set."
+          support_level: full
+        - field: hashOn.cookie
+          type: string
+          required: false
+          default: null
+          description: "Cookie name to take the value from as hash input. If the specified cookie is not in the request, Kong generates a value and sets the cookie in the response."
+          support_level: full
+        - field: hashOn.cookiePath
+          type: string
+          required: false
+          default: "/"
+          description: "Cookie path to set in response headers. Only used when hash_on is cookie."
+          support_level: full
+        - field: hashOn.header
+          type: string
+          required: false
+          default: null
+          description: "Header name to take the value from as hash input. Only used when hash_on is header."
+          support_level: full
+        - field: hashOn.queryArg
+          type: string
+          required: false
+          default: null
+          description: "Query string parameter name to use as hash input."
+          support_level: full
+        - field: hashOn.uriCapture
+          type: string
+          required: false
+          default: null
+          description: "Name of the route URI capture group to use as hash input."
+          support_level: full
+        - field: hashOnFallback.input
+          type: "enum (none, consumer, ip, header, cookie, path, query_arg, uri_capture)"
+          required: false
+          default: null
+          description: "Fallback hash strategy if the primary fails (e.g., consumer not authenticated). Cannot be the same value as hashOn. Cannot be set when hashOn.cookie is used."
+          support_level: full
+        - field: hashOnFallback.header
+          type: string
+          required: false
+          default: null
+          description: "Fallback header name for hashing."
+          support_level: full
+        - field: slots
+          type: integer
+          required: false
+          default: "10000"
+          description: "Number of slots in the consistent hash ring. Must be between 10 and 65536."
+          support_level: full
+
+      attachment_model:
+        attaches_to: Service
+        resource_type: "KongUpstreamPolicy (via konghq.com/upstream-policy annotation on Service)"
+        scope: "per-service (affects all Kong Upstreams created for the Service)"
+
+  attachment_points:
+    - mechanism: Sticky Sessions (Strong Persistence)
+      layer: backend_service
+      native_resource: "KongUpstreamPolicy (configuration.konghq.com/v1beta1)"
+      description: |
+        Sticky sessions are configured per-service via KongUpstreamPolicy. The policy is
+        attached to a Kubernetes Service using the `konghq.com/upstream-policy: <name>`
+        annotation. This affects the Kong Upstream entity created for that Service, and
+        applies to ALL routes that target the Service. There is no route-level or rule-level
+        attachment for sticky sessions — only service-level.
+    - mechanism: Consistent Hashing (Soft Affinity)
+      layer: backend_service
+      native_resource: "KongUpstreamPolicy (configuration.konghq.com/v1beta1)"
+      description: |
+        Consistent hashing is also configured per-service via KongUpstreamPolicy, using the
+        same annotation-based attachment model. Hash-on strategies (cookie, header, IP, etc.)
+        apply to the Kong Upstream entity for the Service.
+
+  gwapi_attachment:
+    route_inline:
+      target_layer: route_rule
+      label: "not implemented"
+      dataplane_target:
+        name: "Kong Upstream sticky-sessions or consistent-hashing"
+        label: "would generate"
+    btp:
+      target_layer: backend_service
+      label: "not implemented"
+      dataplane_target:
+        name: "Kong Upstream sticky-sessions or consistent-hashing"
+        label: "would generate"
+
+  dataplane_translation:
+    description: |
+      KIC translates KongUpstreamPolicy CRDs directly into Kong Gateway Upstream entity
+      configuration. The translation is handled by `TranslateKongUpstreamPolicy()` in the
+      `internal/dataplane/translator` package.
+
+      Translation pipeline:
+      1. KIC watches KongUpstreamPolicy resources and Kubernetes Services with the
+         `konghq.com/upstream-policy` annotation
+      2. `internal/store/CacheStores` holds deserialized CRD objects
+      3. `internal/dataplane/translator.Translator` iterates through objects
+      4. `TranslateKongUpstreamPolicy()` converts `KongUpstreamPolicySpec` to `kong.Upstream`,
+         mapping CamelCase fields to Kong Admin API snake_case fields:
+         - `spec.algorithm` -> `upstream.algorithm`
+         - `spec.hashOn.cookie` -> `upstream.hash_on=cookie`, `upstream.hash_on_cookie`
+         - `spec.hashOn.cookiePath` -> `upstream.hash_on_cookie_path`
+         - `spec.stickySessions.cookie` -> `upstream.sticky_sessions_cookie`
+         - `spec.stickySessions.cookiePath` -> `upstream.sticky_sessions_cookie_path`
+      5. `internal/dataplane/kongstate.KongState` holds the full configuration
+      6. Configuration is serialized to declarative config (DB-less mode) or pushed via Admin API
+      7. Kong Gateway (OpenResty/NGINX + Lua) processes the Upstream entity natively using its
+         balancer module
+
+      Note: Gateway API `sessionPersistence` field is NOT read or processed by KIC. The
+      translation pipeline only processes KongUpstreamPolicy CRDs for session persistence.
+    envoy_features_used: []  # Kong is not Envoy-based
+    key_code_paths:
+      - "internal/dataplane/translator/ — TranslateKongUpstreamPolicy() converts CRD to kong.Upstream"
+      - "internal/dataplane/kongstate/upstream.go — Upstream struct wrapping kong.Upstream with Targets"
+      - "internal/dataplane/kongstate/ — KongState holds full configuration including Upstreams"
+      - "internal/store/CacheStores — holds deserialized CRD objects"
+      - "pkg/apis/configuration/v1beta1/ — KongUpstreamPolicy, KongUpstreamHash, KongUpstreamStickySessions types"
+      - "Kong Gateway: kong/db/schema/entities/upstreams.lua — Upstream entity schema in Kong core"
+    flow: |
+      Sticky Sessions (Strong Persistence):
+        KongUpstreamPolicy.spec.algorithm=sticky-sessions + stickySessions.cookie/cookiePath
+          -> TranslateKongUpstreamPolicy()
+            -> kong.Upstream {
+                 Algorithm: "sticky-sessions",
+                 HashOn: "none",
+                 StickySessionsCookie: "<cookie-name>",
+                 StickySessionsCookiePath: "<path>"
+               }
+          -> Kong Gateway balancer module
+            -> Sets encoded target reference in cookie via Set-Cookie header
+            -> On subsequent requests, decodes cookie to route to same Target
+
+      Consistent Hashing (Soft Affinity):
+        KongUpstreamPolicy.spec.algorithm=consistent-hashing + hashOn.cookie/header/ip/etc.
+          -> TranslateKongUpstreamPolicy()
+            -> kong.Upstream {
+                 Algorithm: "consistent-hashing",
+                 HashOn: "cookie" | "header" | "ip" | ...,
+                 HashOnCookie: "<cookie-name>",
+                 HashOnCookiePath: "<path>"
+               }
+          -> Kong Gateway consistent-hashing balancer
+            -> Generates cookie if not present in request (for cookie hash)
+            -> Routes based on hash value to consistent Target
+
+  capabilities:
+    cookie_persistence: true
+    header_persistence: false   # Consistent hashing supports header hash, but sticky-sessions is cookie-only
+    source_ip_affinity: true    # Via consistent-hashing with hashOn.input=ip (soft affinity only)
+    url_encoded_sessions: false
+    cookie_attributes:
+      name: true        # stickySessions.cookie or hashOn.cookie
+      path: true        # stickySessions.cookiePath or hashOn.cookiePath
+      domain: false     # Not configurable on upstream cookies (only available in Session plugin)
+      ttl: false        # Sticky session cookies are session-scoped only (no configurable TTL)
+      secure: false     # Not configurable on upstream cookies (known gap, GitHub Discussion #13066)
+      http_only: false  # Not configurable on upstream cookies (only available in Session plugin)
+      same_site: false  # Not configurable on upstream cookies (known gap, GitHub Discussion #13066)
+    idle_timeout: false    # No idle timeout for session cookies
+    absolute_timeout: false  # No absolute timeout — sticky session cookies are session-scoped
+    lifetime_type_session: true   # Sticky session cookies are always session-scoped
+    lifetime_type_permanent: false  # No configurable TTL for permanent cookies
+
+  limitations:
+    - "Does NOT implement Gateway API `sessionPersistence` field on HTTPRoute/GRPCRoute rules"
+    - "Does NOT implement Gateway API `BackendLBPolicy` for session persistence"
+    - "Sticky sessions (`sticky-sessions` algorithm) requires Kong Enterprise Gateway — not available in Kong OSS"
+    - "Sticky session cookies are always session-scoped — no configurable TTL, absoluteTimeout, or lifetime type"
+    - "No cookie attributes (Secure, HttpOnly, SameSite, Domain) configurable on upstream cookies (GitHub Discussion #13066)"
+    - "Consistent hashing (soft affinity) may lose affinity when Targets are added or removed"
+    - "Cookie name validation restricts allowed characters to A-Z, a-z, 0-9, _, - (periods not allowed)"
+    - "Session persistence is service-level only (via KongUpstreamPolicy on Service) — no route-level or rule-level attachment"
+    - "No header-based strong persistence — sticky-sessions only supports cookies, not headers"
+    - "Sticky sessions not suitable for long-lived connections (websockets, SSE)"
+    - "Sticky sessions may cause uneven load distribution with long-lived client sessions"
+    - "Cookie-based approach works poorly for machine-to-machine (M2M) clients that omit cookies"
+    - "Kong is going STALE in the v1.5 Gateway API implementations page review (PR #4741) — KIC has not submitted a conformance report for v1.4 or v1.5"
+    - "All new feature development is moving to Kong Operator (github.com/Kong/kong-operator) — KIC is in maintenance mode"
+
+  known_issues:
+    - url: "https://github.com/Kong/kong/discussions/13066"
+      description: "KongUpstreamPolicy sticky session cookie cannot set SameSite=None or Secure=true — cookie attributes not configurable on upstream cookies."
+    - url: "https://github.com/Kong/kubernetes-ingress-controller/issues/132"
+      description: "Historical issue: HashOnCookie and HashOnCookiePath were not propagated through the Ingress Controller (resolved with KongUpstreamPolicy migration)."
+    - url: "https://github.com/Kong/kong/issues/3432"
+      description: "Feature request for sticky sessions support in Kong Gateway — implemented in v3.11 as the sticky-sessions algorithm."
+    - url: "https://github.com/Kong/kong/discussions/11930"
+      description: "Discussion on sticky sessions load balancer algorithm design and implementation details."
+    - url: "https://github.com/Kong/kubernetes-ingress-controller/issues/7582"
+      description: "Fix for KongUpstreamPolicy hash on fallback configuration so cookie hashing works correctly for both hash_on and hash_fallback."
+
+gwapi_assessment:
+  overview: |
+    Kong does NOT implement the Gateway API `sessionPersistence` field on HTTPRoute or GRPCRoute
+    rules. Kong also does NOT implement the Gateway API `BackendLBPolicy` resource. Session
+    persistence in Kong is handled exclusively through its own `KongUpstreamPolicy` CRD, which
+    is attached to Kubernetes Services via annotation.
+
+    Kong's approach diverges significantly from GEP-1619:
+    1. Kong uses service-level attachment (KongUpstreamPolicy on Service) vs. GEP-1619's
+       route-rule-inline and BackendLBPolicy approaches
+    2. Kong's sticky-sessions are cookie-only with no header-based strong persistence
+    3. Kong's cookies are always session-scoped with no configurable TTL
+    4. Kong has no cookie attribute configuration (Secure, HttpOnly, SameSite, Domain)
+    5. Kong Enterprise is required for strong persistence (sticky-sessions algorithm)
+
+    Implementing GEP-1619 would require significant work:
+    - Reading and processing `sessionPersistence` from Gateway API HTTPRoute/GRPCRoute rules
+    - Mapping GEP-1619 fields to Kong Upstream entity configuration
+    - The route-rule-level attachment model conflicts with Kong's service-level model
+    - Kong's dataplane lacks many features GEP-1619 assumes (cookie TTL, attributes, header
+      persistence, idle/absolute timeouts)
+
+    Kong Ingress Controller is also going STALE in the v1.5 implementations page review
+    (PR #4741), and all new development is moving to Kong Operator. Future Gateway API
+    session persistence support would likely need to be implemented in Kong Operator.
+
+    Kong was the first Gateway API implementation to submit a conformance report and has
+    historically been conformant for core features. However, the latest conformance report
+    is for v1.3.0 (kong-operator v2.0.6 standard) and v1.4.1 (kong-operator v2.1.2
+    experimental). Kong Operator v2.1.2 has partial conformance for GATEWAY-HTTP and
+    GATEWAY-GRPC profiles (skipped HTTPRouteWeight and several GRPC tests).
+
+  route_inline:
+    difficulty: significant
+    description: |
+      Kong does NOT implement Gateway API route-inline session persistence. Implementing it
+      would require:
+
+      1. **Reading `sessionPersistence` from HTTPRoute/GRPCRoute rules** — KIC currently
+         ignores this field entirely. The translator pipeline would need to be updated to
+         extract the `sessionPersistence` field from each rule.
+
+      2. **Mapping to Kong's service-level model** — This is the fundamental challenge.
+         Gateway API `sessionPersistence` is per-route-rule, but Kong's session persistence
+         (KongUpstreamPolicy) operates per-service (Upstream entity). A single Service can
+         be targeted by multiple route rules with different session persistence settings,
+         but Kong only has one Upstream per Service. This would require either:
+         - Creating per-route Upstream entities (breaking Kong's 1:1 Service-Upstream model)
+         - Using Kong plugins (e.g., custom Lua plugin) to implement per-route persistence
+         - Leveraging the `sticky-sessions` algorithm with route-specific cookie names
+
+      3. **Cookie attribute mapping** — GEP-1619 specifies `absoluteTimeout`, `idleTimeout`,
+         `lifetimeType` (Session/Permanent), and `sessionName`. Kong's upstream cookies lack
+         configurable TTL, timeout, and security attributes. This would require dataplane
+         changes in Kong Gateway itself.
+
+      4. **Header-based persistence** — GEP-1619 supports `type: Header` in addition to
+         cookies. Kong's `sticky-sessions` algorithm is cookie-only. Adding header-based
+         persistence would require Kong Gateway dataplane changes.
+    mapping_strategy: |
+      No direct mapping exists. The conceptual mapping would be:
+        HTTPRoute.rule.sessionPersistence.sessionName -> sticky_sessions_cookie (or hash_on_cookie)
+        HTTPRoute.rule.sessionPersistence.type: Cookie -> algorithm: sticky-sessions
+        HTTPRoute.rule.sessionPersistence.type: Header -> NOT SUPPORTED in Kong
+        HTTPRoute.rule.sessionPersistence.absoluteTimeout -> NOT SUPPORTED (cookies are session-scoped)
+        HTTPRoute.rule.sessionPersistence.idleTimeout -> NOT SUPPORTED
+        HTTPRoute.rule.sessionPersistence.cookieConfig.lifetimeType -> NOT SUPPORTED (always Session)
+
+      However, the fundamental mismatch is attachment level: Gateway API attaches per-route-rule,
+      Kong attaches per-service. This is not a simple field mapping problem.
+    gotchas:
+      - "Kong's session persistence is per-service (Upstream), not per-route-rule — fundamental architectural mismatch"
+      - "Sticky sessions require Kong Enterprise — not available in Kong OSS"
+      - "No cookie TTL/absoluteTimeout support — cookies are session-scoped only"
+      - "No header-based strong persistence — only cookies"
+      - "No cookie attributes (Secure, HttpOnly, SameSite, Domain) on upstream cookies"
+      - "Cookie name restrictions (no periods) may conflict with Gateway API sessionName values"
+      - "Multiple HTTPRoute rules targeting the same Service but with different sessionPersistence settings cannot be expressed in Kong's model"
+      - "KIC does not currently read the sessionPersistence field at all — full implementation needed"
+    code_changes_needed:
+      - "internal/dataplane/translator/ — add sessionPersistence extraction from HTTPRoute/GRPCRoute rules"
+      - "internal/dataplane/kongstate/ — handle per-route-rule session persistence in KongState"
+      - "Resolve architectural mismatch: per-route-rule (Gateway API) vs per-service (Kong Upstream)"
+      - "Kong Gateway dataplane — add cookie TTL, attributes, header-based persistence support"
+      - "pkg/apis/configuration/v1beta1/ — potentially extend KongUpstreamPolicy or create new CRD"
+
+  backend_traffic_policy:
+    difficulty: moderate
+    description: |
+      Kong's existing KongUpstreamPolicy already attaches to Services (backends), which
+      aligns with GEP-1619's BackendLBPolicy attachment model. Implementing BackendLBPolicy
+      would be more natural for Kong than route-inline because:
+
+      1. KongUpstreamPolicy already targets Services via annotation — same attachment model
+      2. The translation pipeline already handles service-level session persistence
+      3. `TranslateKongUpstreamPolicy()` already translates to Kong Upstream entities
+
+      The main work would be:
+      1. Implementing the Gateway API BackendLBPolicy resource type (watching, parsing)
+      2. Mapping BackendLBPolicy `sessionPersistence` fields to KongUpstreamPolicy equivalents
+      3. Handling precedence between BackendLBPolicy and existing KongUpstreamPolicy
+      4. The same dataplane gaps remain: no cookie TTL, no header persistence, no cookie
+         attributes, Kong Enterprise requirement for sticky-sessions
+    mapping_strategy: |
+      BackendLBPolicy targeting a Service -> KongUpstreamPolicy equivalent on the same Service
+        sessionPersistence.sessionName -> sticky_sessions_cookie (name)
+        sessionPersistence.type: Cookie -> algorithm: sticky-sessions
+        sessionPersistence.type: Header -> NOT SUPPORTED
+        sessionPersistence.absoluteTimeout -> NOT SUPPORTED (would need Kong Gateway changes)
+        sessionPersistence.idleTimeout -> NOT SUPPORTED
+
+      The attachment model aligns well (both target Services), but field-level mapping still
+      has significant gaps due to Kong's limited cookie attribute support.
+    gotchas:
+      - "BackendLBPolicy's service-level attachment aligns with KongUpstreamPolicy's model"
+      - "Precedence between BackendLBPolicy and existing KongUpstreamPolicy needs definition"
+      - "Same dataplane limitations apply: no cookie TTL, no header persistence, no cookie attributes"
+      - "Sticky sessions still require Kong Enterprise"
+      - "BackendLBPolicy route-rule override semantics may be complex with Kong's service-level model"
+    code_changes_needed:
+      - "Add BackendLBPolicy watcher and parser to KIC/Kong Operator"
+      - "Map BackendLBPolicy.sessionPersistence to KongUpstreamPolicy equivalent configuration"
+      - "Handle precedence: BackendLBPolicy vs KongUpstreamPolicy vs route-inline sessionPersistence"
+      - "Kong Gateway dataplane changes for cookie TTL, attributes, header persistence"
+
+  field_mapping:
+    - gwapi_field: "type: Cookie"
+      native_field: "KongUpstreamPolicy algorithm: sticky-sessions (or consistent-hashing with hashOn.cookie)"
+      mapping_difficulty: translation_needed
+      notes: "Maps to sticky-sessions algorithm for strong persistence, or consistent-hashing with cookie hash for soft affinity. Sticky sessions requires Kong Enterprise."
+    - gwapi_field: "type: Header"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "Kong's sticky-sessions algorithm only supports cookies. Consistent-hashing supports hashOn.header but that is soft affinity, not strong persistence."
+    - gwapi_field: "sessionName"
+      native_field: "stickySessions.cookie (or hashOn.cookie)"
+      mapping_difficulty: translation_needed
+      notes: "Maps to cookie name. Cookie name restrictions apply (A-Z, a-z, 0-9, _, - only, no periods). Gateway API sessionName values may contain characters Kong rejects."
+    - gwapi_field: "cookie.lifetimeType: Session"
+      native_field: "stickySessions (session cookies by default)"
+      mapping_difficulty: direct
+      notes: "Kong sticky session cookies are always session-scoped by default — this is the only supported lifetime type."
+    - gwapi_field: "cookie.lifetimeType: Permanent"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "Kong sticky session cookies have no configurable TTL — they are always session-scoped. No way to create permanent cookies."
+    - gwapi_field: "absoluteTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "Kong upstream cookies (both sticky-sessions and consistent-hashing) do not support TTL or absolute timeout configuration."
+    - gwapi_field: "idleTimeout"
+      native_field: null
+      mapping_difficulty: not_supported
+      notes: "No idle timeout support for session persistence cookies in Kong."
+    - gwapi_field: "cookie path"
+      native_field: "stickySessions.cookiePath (or hashOn.cookiePath)"
+      mapping_difficulty: direct
+      notes: "Direct mapping to cookiePath field. Default is /."
+    - gwapi_field: "cookie domain"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "Kong upstream cookies do not support domain configuration. Only available in the separate Session plugin (authentication, not load balancing)."
+    - gwapi_field: "cookie Secure"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "Not configurable on Kong upstream cookies. Known gap (GitHub Discussion #13066). Only available in the Session plugin."
+    - gwapi_field: "cookie HttpOnly"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "Not configurable on Kong upstream cookies. Only available in the Session plugin."
+    - gwapi_field: "cookie SameSite"
+      native_field: null
+      mapping_difficulty: no_native_equivalent
+      notes: "Not configurable on Kong upstream cookies. Known gap causing Chrome cross-origin issues (GitHub Discussion #13066). Only available in the Session plugin."
+
+  deviations:
+    - "Kong does NOT implement Gateway API sessionPersistence field — uses its own KongUpstreamPolicy CRD"
+    - "Session persistence is per-service (Upstream entity), not per-route-rule as GEP-1619 specifies"
+    - "Sticky sessions require Kong Enterprise Gateway — not available in Kong OSS"
+    - "Sticky session cookies are always session-scoped — no configurable TTL (absoluteTimeout)"
+    - "No header-based strong persistence — sticky-sessions algorithm is cookie-only"
+    - "No cookie attributes (Secure, HttpOnly, SameSite, Domain) on upstream cookies"
+    - "No idleTimeout support"
+    - "Cookie name restricted to A-Z, a-z, 0-9, _, - (no periods)"
+    - "Cookie value contains encoded target reference — security model differs from Envoy's stateful_session (which encodes the actual backend address)"
+    - "Consistent hashing (soft affinity) is the only session affinity available in Kong OSS"
+    - "KongUpstreamPolicy attaches via annotation on Service, not via Gateway API policy attachment (targetRef)"
+    - "Kong Operator is the future direction — KIC is in maintenance mode for new features"
+    - "Kong Ingress Controller going STALE in v1.5 implementations page review (PR #4741)"
+
+  overall_difficulty: significant
+  summary: |
+    Kong is one of the MORE DIFFICULT implementations for GEP-1619 session persistence because:
+
+    (1) Kong does NOT implement Gateway API `sessionPersistence` field at all — KIC/Kong Operator
+        completely ignores the field on HTTPRoute and GRPCRoute rules.
+
+    (2) Fundamental architectural mismatch — Gateway API `sessionPersistence` is per-route-rule,
+        but Kong's session persistence (KongUpstreamPolicy) operates per-service (Upstream entity).
+        A single Kong Upstream serves all routes targeting a Service, making per-rule persistence
+        settings impossible without significant architectural changes.
+
+    (3) Kong Enterprise requirement — the `sticky-sessions` algorithm (strong persistence) requires
+        Kong Enterprise Gateway. Kong OSS only offers `consistent-hashing` (soft affinity).
+
+    (4) Limited cookie attribute support — no TTL (absoluteTimeout), no Secure, HttpOnly, SameSite,
+        Domain attributes on upstream cookies. These are fundamental GEP-1619 features that would
+        require Kong Gateway dataplane changes.
+
+    (5) No header-based strong persistence — `sticky-sessions` is cookie-only.
+
+    (6) Going STALE — Kong Ingress Controller is going STALE in the v1.5 implementations page
+        review (PR #4741), and all new development is moving to Kong Operator.
+
+    The BackendLBPolicy approach (service-level attachment) is MORE feasible for Kong because it
+    aligns with KongUpstreamPolicy's existing service-level attachment model. However, even for
+    BackendLBPolicy, significant dataplane changes would be needed in Kong Gateway itself to
+    support cookie TTL, attributes, and header-based persistence.
+
+    Kong's existing session persistence (via KongUpstreamPolicy with sticky-sessions or
+    consistent-hashing) is functional for basic use cases but lacks the granularity and
+    configurability that GEP-1619 specifies. The Session plugin has richer cookie attribute
+    support but serves a different purpose (authentication session management, not load
+    balancing affinity).
+
+    If Kong were to implement GEP-1619, the recommended approach would be:
+    1. Start with BackendLBPolicy (aligns with existing service-level model)
+    2. Map to KongUpstreamPolicy configuration (existing translation pipeline)
+    3. Add cookie attribute support to Kong Gateway's Upstream entity
+    4. Potentially add per-route overrides for route-inline sessionPersistence
+    5. Implement in Kong Operator (not KIC, which is in maintenance mode)

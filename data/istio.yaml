@@ -19,9 +19,14 @@ api_stack:
     - name: Istio API
       type: intermediate
       resources:
-        - "DestinationRule.trafficPolicy.loadBalancer.consistentHash"
-        - "Service label: istio.io/persistent-session"
-      description: "Istio's native API layer. Session persistence is configured here today. Gateway API would need to translate through this layer (or bypass it)."
+        - "DestinationRule.trafficPolicy.loadBalancer.sessionPersistence (PR #3502, in progress)"
+        - "DestinationRule.trafficPolicy.loadBalancer.consistentHash (soft affinity, NOT session persistence)"
+        - "Service label: istio.io/persistent-session (experimental)"
+      description: |
+        Istio's native API layer. Strong session persistence is being added to DestinationRule via
+        PR istio/api#3502 using Envoy's stateful_session filter. ConsistentHashLB provides soft
+        affinity only and is not considered session persistence per GEP-1619's definition. Gateway API
+        sessionPersistence will translate through the new DestinationRule sessionPersistence field.
     - name: Envoy xDS
       type: dataplane
       resources:
@@ -32,12 +37,12 @@ api_stack:
 
 native_profile:
   overview: |
-    Istio provides two completely independent session persistence mechanisms, each using
-    different Envoy features with different trade-offs. `ConsistentHashLB` (via `DestinationRule`)
-    provides soft session affinity using hash-based load balancing. The Stateful Session Filter
-    (via Service labels + env var) provides strong session persistence by encoding backend
-    identity directly into cookies/headers. These two mechanisms have entirely separate
-    configuration surfaces and code paths.
+    Istio is adding strong session persistence to DestinationRule (PR istio/api#3502) using Envoy's
+    `stateful_session` filter. This will be the mechanism that Gateway API `sessionPersistence`
+    translates through. Separately, Istio has `ConsistentHashLB` (via `DestinationRule`) which
+    provides soft session affinity using hash-based load balancing — this is NOT session persistence
+    per GEP-1619's definition. The experimental Stateful Session Filter (via Service labels) is the
+    predecessor to the DestinationRule `sessionPersistence` field being added in PR #3502.
 
   mechanisms:
     - name: ConsistentHashLB
@@ -220,7 +225,9 @@ native_profile:
 
   known_issues:
     - url: https://github.com/istio/istio/issues/55839
-      description: "Implement `SessionPersistence` in Gateway API — open, unresolved architectural question (stateful session vs consistent hash)"
+      description: "Implement `SessionPersistence` in Gateway API — open, waiting on DestinationRule API (PR istio/api#3502)"
+    - url: https://github.com/istio/api/pull/3502
+      description: "Add sessionPersistence to DestinationRule using stateful_session filter — open PR"
     - url: https://github.com/istio/istio/issues/49000
       description: "Persistent session filter regression — sessions break after ~1 minute in Istio 1.19+"
     - url: https://github.com/istio/istio/issues/56268
@@ -238,27 +245,25 @@ native_profile:
       native_translation: null
       label: "no native route-level session API"
       dataplane_target:
-        name: "Envoy hash_policy or stateful_session"
-        label: "? must bypass native API"
+        name: "Envoy stateful_session filter"
+        label: "must bypass DestinationRule"
     btp:
       target_layer: backend_service
       native_translations:
-        - mechanism: ConsistentHashLB
-          label: "? soft affinity only"
         - mechanism: Stateful Session Filter
-          label: "? experimental"
+          label: "via DR sessionPersistence (PR #3502)"
       dataplane_target:
-        name: "Envoy hash_policy or stateful_session"
-        label: "? mechanism unresolved"
-      open_question: "Which Envoy mechanism should BTP translate to? ConsistentHashLB (soft, proven) or StatefulSession (strong, experimental)?"
+        name: "Envoy stateful_session filter"
+        label: "translates through DR"
 
 gwapi_assessment:
   overview: |
     Istio has recognized the need to implement GEP-1619 (tracked in istio/istio#55839) but has
     NOT yet implemented it. The current code explicitly drops `sessionPersistence` config with a
-    TODO comment. The fundamental architectural question — whether to use Envoy's `StatefulSession`
-    filter (strong persistence) or `ConsistentHashLB` (soft affinity) — remains unresolved. Istio's
-    native `DestinationRule` model attaches to backends (services), which maps well to
+    TODO comment. Istio is adding strong session persistence (`stateful_session` filter) to
+    DestinationRule via PR istio/api#3502, which will serve as the native API that Gateway API
+    translates through. `ConsistentHashLB` is soft affinity only and is not suitable for GEP-1619.
+    Istio's `DestinationRule` model attaches to backends (services), which maps well to
     `BackendTrafficPolicy` but creates tension with route-inline `sessionPersistence`.
 
   route_inline:
@@ -291,29 +296,23 @@ gwapi_assessment:
     difficulty: moderate
     description: |
       `BackendTrafficPolicy` attaching to a Service maps naturally to Istio's `DestinationRule`
-      model (which also attaches to a service). The config options (cookie name, type, timeouts)
-      have reasonable Envoy equivalents. The main challenge is deciding which Envoy mechanism
-      to use (hash policy vs stateful session) and handling fields that don't map directly
-      (idle timeout, lifetime type).
+      model (which also attaches to a service). Once PR istio/api#3502 lands, Gateway API BTP
+      `sessionPersistence` will translate to DestinationRule's new `sessionPersistence` field,
+      which uses Envoy's `stateful_session` filter for strong persistence.
     mapping_strategy: |
-      `BackendTrafficPolicy.sessionPersistence` → either:
-      (a) Generate a `DestinationRule` with `ConsistentHashLB` config, or
-      (b) Generate `StatefulSession` filter config (requires `PILOT_ENABLE_PERSISTENT_SESSION_FILTER`
-          or inlining that logic into the Gateway API controller)
+      `BackendTrafficPolicy.sessionPersistence` → DestinationRule `sessionPersistence` (PR #3502)
+      → Envoy `stateful_session` filter (HCM-level disabled, per-route override via TypedPerFilterConfig)
     gotchas:
-      - "Fundamental design choice: `ConsistentHashLB` (soft) vs `StatefulSession` (strong) is unresolved"
-      - "GEP-1619 says session persistence is 'strong' — this implies `StatefulSession`, not `ConsistentHashLB`"
-      - "`StatefulSession` filter is behind a feature flag and lacks CRD-level configuration in Istio"
-      - "Cookie path is always '/' for BTP — matches `StatefulSession` default but not `ConsistentHashLB` (which has no default)"
-      - "`IdleTimeout` has no Envoy equivalent in either mechanism — would need server-side tracking"
-      - "`AbsoluteTimeout` maps to cookie `TTL` for `ConsistentHashLB` but `StatefulSession` has no `TTL` field"
-      - "`LifetimeType` (`Session` vs `Permanent`) maps to `TTL=0` vs `TTL>0` in `ConsistentHashLB`"
+      - "Waiting on PR istio/api#3502 to land before implementation can proceed"
+      - "Cookie path is always '/' for BTP — matches `StatefulSession` default"
+      - "`IdleTimeout` has no Envoy equivalent — would need server-side tracking"
+      - "`AbsoluteTimeout` maps to cookie TTL in the new DR `sessionPersistence.cookie.ttl`"
+      - "`LifetimeType` (`Session` vs `Permanent`) maps to `TTL=0` vs `TTL>0`"
+      - "Privacy concern with persistent cookies raised by Istio maintainers (costinm)"
     code_changes_needed:
       - "`pilot/pkg/config/kube/gateway/backend_policies.go` — replace TODO with actual implementation"
-      - "Decide on Envoy mechanism (`StatefulSession` vs `ConsistentHashLB`)"
-      - "Map `SessionPersistence` fields to chosen Envoy config"
+      - "Map `SessionPersistence` fields to new DestinationRule `sessionPersistence`"
       - "Handle cookie name uniqueness validation across BTPs"
-      - "If using `StatefulSession`: may need to decouple from feature flag / Service label mechanism"
 
   field_mapping:
     - gwapi_field: "type: Cookie"
@@ -355,24 +354,23 @@ gwapi_assessment:
 
   deviations:
     - "Istio's native model is service-scoped (`DestinationRule`), not route-scoped. Route-inline session config has no natural home."
-    - "GEP-1619 defines session persistence as 'strong' but Istio's primary mechanism (`ConsistentHashLB`) is 'soft' affinity."
-    - "Istio's strong persistence (`StatefulSession`) is experimental, behind a feature flag, and configured via labels — not a CRD."
+    - "`ConsistentHashLB` is soft affinity, not session persistence per GEP-1619's definition."
+    - "Istio is adding strong session persistence to DestinationRule (PR istio/api#3502) using `stateful_session` filter."
     - "`IdleTimeout` has no implementation path without server-side session tracking in the dataplane."
     - "Cookie name uniqueness is a new constraint — Istio has no equivalent validation today."
     - "The 'longest common prefix' cookie path computation for multiple path matches has no Istio parallel."
     - "Route-inline overriding BTP inverts Istio's model where `DestinationRule` (backend) is the authority for LB config."
+    - "Istio maintainers recommend using Gateway API (not DestinationRule) for gateways and waypoints."
 
   overall_difficulty: significant
   summary: |
     Implementing GEP-1619 in Istio is a significant effort, primarily because:
-    (1) Istio must first resolve whether to use `ConsistentHashLB` or `StatefulSession` — the GEP's
-        definition of "strong" persistence implies `StatefulSession`, but that mechanism is
-        experimental and lacks CRD configuration.
-    (2) Route-inline `sessionPersistence` has no natural equivalent — Istio's session config lives
+    (1) Route-inline `sessionPersistence` has no natural equivalent — Istio's session config lives
         on `DestinationRule` (service-scoped), requiring new code paths to generate per-route
         Envoy config from `HTTPRoute` rules.
+    (2) `BackendTrafficPolicy` maps naturally to the new `DestinationRule.sessionPersistence` field
+        being added in PR istio/api#3502.
     (3) `IdleTimeout` is not implementable without dataplane changes.
-    (4) `BackendTrafficPolicy` maps more naturally to `DestinationRule`, but still requires the
-        mechanism choice and field translation work.
-    The existing tracking issue (istio/istio#55839) confirms this is known and in-progress
-    but architecturally unresolved.
+    (4) Istio maintainers recommend using Gateway API for gateways/waypoints and DestinationRule
+        only for sidecar-to-sidecar persistence (costinm, PR #3502).
+    The existing tracking issue (istio/istio#55839) confirms this is known and in-progress.
